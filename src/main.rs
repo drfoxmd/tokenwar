@@ -24,6 +24,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(name = "tokenwar", version, about = "Compare LLM responses side-by-side")]
@@ -93,6 +94,8 @@ struct ProviderUpdate {
     append: Option<String>,
     done: bool,
     error: Option<String>,
+    first_token_ms: Option<u64>,
+    total_time_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +103,8 @@ struct ProviderResult {
     provider: Provider,
     text: String,
     error: Option<String>,
+    total_time_ms: u64,
+    first_token_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -179,12 +184,13 @@ async fn main() -> Result<()> {
         let prompt = prompt.clone();
         let stream = args.stream;
         let handle = tokio::spawn(async move {
+            let start = Instant::now();
             let result = match provider {
-                Provider::Anthropic => call_anthropic(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::OpenAI => call_openai(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::Grok => call_grok(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::Gemini => call_gemini(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::Generic => call_generic(&client, &config, &prompt, stream, index, tx.clone()).await,
+                Provider::Anthropic => call_anthropic(&client, &config, &prompt, stream, index, tx.clone(), start).await,
+                Provider::OpenAI => call_openai(&client, &config, &prompt, stream, index, tx.clone(), start).await,
+                Provider::Grok => call_grok(&client, &config, &prompt, stream, index, tx.clone(), start).await,
+                Provider::Gemini => call_gemini(&client, &config, &prompt, stream, index, tx.clone(), start).await,
+                Provider::Generic => call_generic(&client, &config, &prompt, stream, index, tx.clone(), start).await,
             };
             if let Err(err) = result {
                 let _ = tx
@@ -193,6 +199,8 @@ async fn main() -> Result<()> {
                         append: None,
                         done: true,
                         error: Some(err.to_string()),
+                        first_token_ms: None,
+                        total_time_ms: Some(start.elapsed().as_millis() as u64),
                     })
                     .await;
             }
@@ -206,26 +214,36 @@ async fn main() -> Result<()> {
             provider: Provider::Anthropic,
             text: String::new(),
             error: None,
+            total_time_ms: 0,
+            first_token_ms: None,
         },
         ProviderResult {
             provider: Provider::OpenAI,
             text: String::new(),
             error: None,
+            total_time_ms: 0,
+            first_token_ms: None,
         },
         ProviderResult {
             provider: Provider::Grok,
             text: String::new(),
             error: None,
+            total_time_ms: 0,
+            first_token_ms: None,
         },
         ProviderResult {
             provider: Provider::Gemini,
             text: String::new(),
             error: None,
+            total_time_ms: 0,
+            first_token_ms: None,
         },
         ProviderResult {
             provider: Provider::Generic,
             text: String::new(),
             error: None,
+            total_time_ms: 0,
+            first_token_ms: None,
         },
     ];
 
@@ -240,7 +258,7 @@ async fn main() -> Result<()> {
     }
 
     let judge = run_judge(&client, &config, &prompt, &results).await?;
-    render_scoreboard(&judge);
+    render_scoreboard(&judge, &results);
 
     Ok(())
 }
@@ -269,6 +287,14 @@ async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Pr
         if let Some(chunk) = update.append {
             entry.text.push_str(&chunk);
         }
+        if entry.first_token_ms.is_none() {
+            if let Some(first_token_ms) = update.first_token_ms {
+                entry.first_token_ms = Some(first_token_ms);
+            }
+        }
+        if let Some(total_time_ms) = update.total_time_ms {
+            entry.total_time_ms = total_time_ms;
+        }
         if let Some(err) = update.error {
             entry.error = Some(err);
         }
@@ -280,6 +306,7 @@ async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Pr
             } else {
                 println!("{}", entry.text.trim());
             }
+            println!("{}", format_latency_line(entry));
         }
     }
     Ok(())
@@ -300,6 +327,14 @@ async fn run_tui(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Provider
             let entry = &mut results[update.index];
             if let Some(chunk) = update.append {
                 entry.text.push_str(&chunk);
+            }
+            if entry.first_token_ms.is_none() {
+                if let Some(first_token_ms) = update.first_token_ms {
+                    entry.first_token_ms = Some(first_token_ms);
+                }
+            }
+            if let Some(total_time_ms) = update.total_time_ms {
+                entry.total_time_ms = total_time_ms;
             }
             if let Some(err) = update.error {
                 entry.error = Some(err);
@@ -362,10 +397,16 @@ fn render_panel(f: &mut ratatui::Frame, area: Rect, result: &ProviderResult) {
     let block = Block::default()
         .title(Span::styled(title, Style::default().fg(Color::Cyan)))
         .borders(Borders::ALL);
-    let paragraph = Paragraph::new(Text::from(text))
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(paragraph, area);
+    f.render_widget(block.clone(), area);
+    let inner = block.inner(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let paragraph = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false });
+    f.render_widget(paragraph, chunks[0]);
+    let status = Paragraph::new(format_latency_inline(result)).wrap(Wrap { trim: true });
+    f.render_widget(status, chunks[1]);
 }
 
 async fn call_anthropic(
@@ -375,6 +416,7 @@ async fn call_anthropic(
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
+    start: Instant,
 ) -> Result<()> {
     let body = serde_json::json!({
         "model": config.anthropic_model,
@@ -392,6 +434,7 @@ async fn call_anthropic(
     if stream {
         let resp = req.send().await?;
         let mut stream = resp.bytes_stream();
+        let mut first_sent = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             let text = String::from_utf8_lossy(&chunk);
@@ -403,12 +446,20 @@ async fn call_anthropic(
                     if let Ok(value) = serde_json::from_str::<Value>(data) {
                         if value["type"] == "content_block_delta" {
                             if let Some(delta) = value["delta"]["text"].as_str() {
+                                let first_token_ms = if !first_sent {
+                                    first_sent = true;
+                                    Some(start.elapsed().as_millis() as u64)
+                                } else {
+                                    None
+                                };
                                 let _ = tx
                                     .send(ProviderUpdate {
                                         index,
                                         append: Some(delta.to_string()),
                                         done: false,
                                         error: None,
+                                        first_token_ms,
+                                        total_time_ms: None,
                                     })
                                     .await;
                             }
@@ -431,6 +482,8 @@ async fn call_anthropic(
                 append: Some(text),
                 done: false,
                 error: None,
+                first_token_ms: None,
+                total_time_ms: None,
             })
             .await;
     }
@@ -441,6 +494,8 @@ async fn call_anthropic(
             append: None,
             done: true,
             error: None,
+            first_token_ms: None,
+            total_time_ms: Some(start.elapsed().as_millis() as u64),
         })
         .await;
     Ok(())
@@ -453,6 +508,7 @@ async fn call_openai(
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
+    start: Instant,
 ) -> Result<()> {
     call_openai_like(
         client,
@@ -463,6 +519,7 @@ async fn call_openai(
         stream,
         index,
         tx,
+        start,
     )
     .await
 }
@@ -474,6 +531,7 @@ async fn call_grok(
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
+    start: Instant,
 ) -> Result<()> {
     call_openai_like(
         client,
@@ -484,6 +542,7 @@ async fn call_grok(
         stream,
         index,
         tx,
+        start,
     )
     .await
 }
@@ -495,6 +554,7 @@ async fn call_generic(
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
+    start: Instant,
 ) -> Result<()> {
     let key = config
         .generic_key
@@ -509,7 +569,7 @@ async fn call_generic(
         .as_ref()
         .ok_or(ProviderError::MissingConfig("GENERIC_API_URL"))?;
 
-    call_openai_like(client, key, url, model, prompt, stream, index, tx).await
+    call_openai_like(client, key, url, model, prompt, stream, index, tx, start).await
 }
 
 async fn call_openai_like(
@@ -521,6 +581,7 @@ async fn call_openai_like(
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
+    start: Instant,
 ) -> Result<()> {
     let body = serde_json::json!({
         "model": model,
@@ -538,6 +599,7 @@ async fn call_openai_like(
     if stream {
         let resp = req.send().await?;
         let mut stream = resp.bytes_stream();
+        let mut first_sent = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             let text = String::from_utf8_lossy(&chunk);
@@ -548,12 +610,20 @@ async fn call_openai_like(
                     }
                     if let Ok(value) = serde_json::from_str::<Value>(data) {
                         if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+                            let first_token_ms = if !first_sent {
+                                first_sent = true;
+                                Some(start.elapsed().as_millis() as u64)
+                            } else {
+                                None
+                            };
                             let _ = tx
                                 .send(ProviderUpdate {
                                     index,
                                     append: Some(delta.to_string()),
                                     done: false,
                                     error: None,
+                                    first_token_ms,
+                                    total_time_ms: None,
                                 })
                                 .await;
                         }
@@ -574,6 +644,8 @@ async fn call_openai_like(
                 append: Some(text),
                 done: false,
                 error: None,
+                first_token_ms: None,
+                total_time_ms: None,
             })
             .await;
     }
@@ -584,6 +656,8 @@ async fn call_openai_like(
             append: None,
             done: true,
             error: None,
+            first_token_ms: None,
+            total_time_ms: Some(start.elapsed().as_millis() as u64),
         })
         .await;
     Ok(())
@@ -596,6 +670,7 @@ async fn call_gemini(
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
+    start: Instant,
 ) -> Result<()> {
     let endpoint = if stream {
         format!(
@@ -622,6 +697,7 @@ async fn call_gemini(
     if stream {
         let resp = req.send().await?;
         let mut stream = resp.bytes_stream();
+        let mut first_sent = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             let text = String::from_utf8_lossy(&chunk);
@@ -631,12 +707,20 @@ async fn call_gemini(
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(line) {
                     if let Some(part) = value["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                        let first_token_ms = if !first_sent {
+                            first_sent = true;
+                            Some(start.elapsed().as_millis() as u64)
+                        } else {
+                            None
+                        };
                         let _ = tx
                             .send(ProviderUpdate {
                                 index,
                                 append: Some(part.to_string()),
                                 done: false,
                                 error: None,
+                                first_token_ms,
+                                total_time_ms: None,
                             })
                             .await;
                     }
@@ -656,6 +740,8 @@ async fn call_gemini(
                 append: Some(text),
                 done: false,
                 error: None,
+                first_token_ms: None,
+                total_time_ms: None,
             })
             .await;
     }
@@ -666,6 +752,8 @@ async fn call_gemini(
             append: None,
             done: true,
             error: None,
+            first_token_ms: None,
+            total_time_ms: Some(start.elapsed().as_millis() as u64),
         })
         .await;
     Ok(())
@@ -824,8 +912,12 @@ async fn call_generic_judge(client: &Client, config: &Config, prompt: &str) -> R
     Ok(value["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
 }
 
-fn render_scoreboard(scores: &JudgeScores) {
+fn render_scoreboard(scores: &JudgeScores, results: &[ProviderResult]) {
     println!("\n=== Scoreboard ===");
+    let mut latency_lookup = std::collections::HashMap::new();
+    for result in results {
+        latency_lookup.insert(result.provider.name(), result);
+    }
     let mut totals: Vec<(String, f64)> = scores
         .scores
         .iter()
@@ -841,14 +933,23 @@ fn render_scoreboard(scores: &JudgeScores) {
     totals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     for (rank, (provider, total)) in totals.iter().enumerate() {
-        println!("{}. {} - {:.1}/50", rank + 1, provider, total);
+        let latency = latency_lookup
+            .get(provider.as_str())
+            .map(|r| format_latency_inline(r))
+            .unwrap_or_else(|| "Latency: n/a".to_string());
+        println!("{}. {} - {:.1}/50 ({})", rank + 1, provider, total, latency);
     }
 
     println!("\n=== Details ===");
     for score in &scores.scores {
+        let latency = latency_lookup
+            .get(score.provider.as_str())
+            .map(|r| format_latency_inline(r))
+            .unwrap_or_else(|| "Latency: n/a".to_string());
         println!(
-            "\n{}:\n  Accuracy: {:.1} ({})\n  Helpfulness: {:.1} ({})\n  Clarity: {:.1} ({})\n  Creativity: {:.1} ({})\n  Conciseness: {:.1} ({})",
+            "\n{}:\n  {}\n  Accuracy: {:.1} ({})\n  Helpfulness: {:.1} ({})\n  Clarity: {:.1} ({})\n  Creativity: {:.1} ({})\n  Conciseness: {:.1} ({})",
             score.provider,
+            latency,
             score.accuracy.score,
             score.accuracy.reasoning,
             score.helpfulness.score,
@@ -861,4 +962,21 @@ fn render_scoreboard(scores: &JudgeScores) {
             score.conciseness.reasoning
         );
     }
+}
+
+fn format_latency_line(result: &ProviderResult) -> String {
+    format!("Latency: {}", format_latency_inline(result))
+}
+
+fn format_latency_inline(result: &ProviderResult) -> String {
+    let total = if result.total_time_ms > 0 {
+        format!("Total {} ms", result.total_time_ms)
+    } else {
+        "Total --".to_string()
+    };
+    let first = match result.first_token_ms {
+        Some(ms) => format!("TTFB {} ms", ms),
+        None => "TTFB --".to_string(),
+    };
+    format!("{} | {}", first, total)
 }
