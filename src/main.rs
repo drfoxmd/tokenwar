@@ -43,14 +43,14 @@ struct Args {
 
 #[derive(Clone, Debug)]
 struct Config {
-    anthropic_key: String,
-    anthropic_model: String,
-    openai_key: String,
-    openai_model: String,
-    grok_key: String,
-    grok_model: String,
-    gemini_key: String,
-    gemini_model: String,
+    anthropic_key: Option<String>,
+    anthropic_model: Option<String>,
+    openai_key: Option<String>,
+    openai_model: Option<String>,
+    grok_key: Option<String>,
+    grok_model: Option<String>,
+    gemini_key: Option<String>,
+    gemini_model: Option<String>,
     generic_key: Option<String>,
     generic_model: Option<String>,
     generic_url: Option<String>,
@@ -161,13 +161,12 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(args.timeout_secs))
         .build()?;
 
-    let providers = vec![
-        Provider::Anthropic,
-        Provider::OpenAI,
-        Provider::Grok,
-        Provider::Gemini,
-        Provider::Generic,
-    ];
+    let providers = configured_providers(&config);
+    if providers.len() < 2 {
+        return Err(anyhow!(
+            "need at least 2 configured providers; set at least two API keys and models (e.g. ANTHROPIC_API_KEY + ANTHROPIC_MODEL)"
+        ));
+    }
 
     let (tx, rx) = mpsc::channel::<ProviderUpdate>(128);
     let mut handles = Vec::new();
@@ -201,33 +200,15 @@ async fn main() -> Result<()> {
     }
     drop(tx);
 
-    let mut results = vec![
-        ProviderResult {
-            provider: Provider::Anthropic,
+    let mut results = providers
+        .iter()
+        .cloned()
+        .map(|provider| ProviderResult {
+            provider,
             text: String::new(),
             error: None,
-        },
-        ProviderResult {
-            provider: Provider::OpenAI,
-            text: String::new(),
-            error: None,
-        },
-        ProviderResult {
-            provider: Provider::Grok,
-            text: String::new(),
-            error: None,
-        },
-        ProviderResult {
-            provider: Provider::Gemini,
-            text: String::new(),
-            error: None,
-        },
-        ProviderResult {
-            provider: Provider::Generic,
-            text: String::new(),
-            error: None,
-        },
-    ];
+        })
+        .collect::<Vec<_>>();
 
     if args.no_tui {
         collect_plain(rx, &mut results).await?;
@@ -247,20 +228,40 @@ async fn main() -> Result<()> {
 
 fn load_config() -> Result<Config> {
     Ok(Config {
-        anthropic_key: env::var("ANTHROPIC_API_KEY").context("missing ANTHROPIC_API_KEY")?,
-        anthropic_model: env::var("ANTHROPIC_MODEL").context("missing ANTHROPIC_MODEL")?,
-        openai_key: env::var("OPENAI_API_KEY").context("missing OPENAI_API_KEY")?,
-        openai_model: env::var("OPENAI_MODEL").context("missing OPENAI_MODEL")?,
-        grok_key: env::var("GROK_API_KEY").context("missing GROK_API_KEY")?,
-        grok_model: env::var("GROK_MODEL").context("missing GROK_MODEL")?,
-        gemini_key: env::var("GEMINI_API_KEY").context("missing GEMINI_API_KEY")?,
-        gemini_model: env::var("GEMINI_MODEL").context("missing GEMINI_MODEL")?,
+        anthropic_key: env::var("ANTHROPIC_API_KEY").ok(),
+        anthropic_model: env::var("ANTHROPIC_MODEL").ok(),
+        openai_key: env::var("OPENAI_API_KEY").ok(),
+        openai_model: env::var("OPENAI_MODEL").ok(),
+        grok_key: env::var("GROK_API_KEY").ok(),
+        grok_model: env::var("GROK_MODEL").ok(),
+        gemini_key: env::var("GEMINI_API_KEY").ok(),
+        gemini_model: env::var("GEMINI_MODEL").ok(),
         generic_key: env::var("GENERIC_API_KEY").ok(),
         generic_model: env::var("GENERIC_MODEL").ok(),
         generic_url: env::var("GENERIC_API_URL").ok(),
         judge_provider: env::var("JUDGE_PROVIDER").unwrap_or_else(|_| "anthropic".to_string()),
         judge_model: env::var("JUDGE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
     })
+}
+
+fn configured_providers(config: &Config) -> Vec<Provider> {
+    let mut providers = Vec::new();
+    if config.anthropic_key.is_some() && config.anthropic_model.is_some() {
+        providers.push(Provider::Anthropic);
+    }
+    if config.openai_key.is_some() && config.openai_model.is_some() {
+        providers.push(Provider::OpenAI);
+    }
+    if config.grok_key.is_some() && config.grok_model.is_some() {
+        providers.push(Provider::Grok);
+    }
+    if config.gemini_key.is_some() && config.gemini_model.is_some() {
+        providers.push(Provider::Gemini);
+    }
+    if config.generic_key.is_some() && config.generic_model.is_some() && config.generic_url.is_some() {
+        providers.push(Provider::Generic);
+    }
+    providers
 }
 
 async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult]) -> Result<()> {
@@ -311,24 +312,65 @@ async fn run_tui(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Provider
 
         terminal.draw(|f| {
             let size = f.size();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(size);
-            let top = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
-                .split(chunks[0]);
-            let bottom = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[1]);
+            match results.len() {
+                0 => {}
+                1 => render_panel(f, size, &results[0]),
+                2 => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(size);
+                    render_panel(f, chunks[0], &results[0]);
+                    render_panel(f, chunks[1], &results[1]);
+                }
+                3 => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
+                        .split(size);
+                    render_panel(f, chunks[0], &results[0]);
+                    render_panel(f, chunks[1], &results[1]);
+                    render_panel(f, chunks[2], &results[2]);
+                }
+                4 => {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(size);
+                    let top = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(rows[0]);
+                    let bottom = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(rows[1]);
+                    render_panel(f, top[0], &results[0]);
+                    render_panel(f, top[1], &results[1]);
+                    render_panel(f, bottom[0], &results[2]);
+                    render_panel(f, bottom[1], &results[3]);
+                }
+                _ => {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .split(size);
+                    let top = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
+                        .split(rows[0]);
+                    let bottom = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(rows[1]);
 
-            render_panel(f, top[0], &results[0]);
-            render_panel(f, top[1], &results[1]);
-            render_panel(f, top[2], &results[2]);
-            render_panel(f, bottom[0], &results[3]);
-            render_panel(f, bottom[1], &results[4]);
+                    render_panel(f, top[0], &results[0]);
+                    render_panel(f, top[1], &results[1]);
+                    render_panel(f, top[2], &results[2]);
+                    render_panel(f, bottom[0], &results[3]);
+                    render_panel(f, bottom[1], &results[4]);
+                }
+            }
         })?;
 
         if done_count >= results.len() {
@@ -376,15 +418,23 @@ async fn call_anthropic(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let key = config
+        .anthropic_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("ANTHROPIC_API_KEY"))?;
+    let model = config
+        .anthropic_model
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("ANTHROPIC_MODEL"))?;
     let body = serde_json::json!({
-        "model": config.anthropic_model,
+        "model": model,
         "max_tokens": 1024,
         "messages": [{"role": "user", "content": prompt}],
         "stream": stream,
     });
     let req = client
         .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &config.anthropic_key)
+        .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .header(header::CONTENT_TYPE, "application/json")
         .json(&body);
@@ -454,11 +504,19 @@ async fn call_openai(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let key = config
+        .openai_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("OPENAI_API_KEY"))?;
+    let model = config
+        .openai_model
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("OPENAI_MODEL"))?;
     call_openai_like(
         client,
-        &config.openai_key,
+        key,
         "https://api.openai.com/v1/chat/completions",
-        &config.openai_model,
+        model,
         prompt,
         stream,
         index,
@@ -475,11 +533,19 @@ async fn call_grok(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let key = config
+        .grok_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("GROK_API_KEY"))?;
+    let model = config
+        .grok_model
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("GROK_MODEL"))?;
     call_openai_like(
         client,
-        &config.grok_key,
+        key,
         "https://api.x.ai/v1/chat/completions",
-        &config.grok_model,
+        model,
         prompt,
         stream,
         index,
@@ -597,15 +663,23 @@ async fn call_gemini(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let key = config
+        .gemini_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("GEMINI_API_KEY"))?;
+    let model = config
+        .gemini_model
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("GEMINI_MODEL"))?;
     let endpoint = if stream {
         format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}",
-            config.gemini_model, config.gemini_key
+            model, key
         )
     } else {
         format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            config.gemini_model, config.gemini_key
+            model, key
         )
     };
 
@@ -725,6 +799,10 @@ fn parse_judge_scores(text: &str) -> Result<JudgeScores> {
 }
 
 async fn call_anthropic_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
+    let key = config
+        .anthropic_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("ANTHROPIC_API_KEY"))?;
     let body = serde_json::json!({
         "model": config.judge_model,
         "max_tokens": 1024,
@@ -732,7 +810,7 @@ async fn call_anthropic_judge(client: &Client, config: &Config, prompt: &str) ->
     });
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &config.anthropic_key)
+        .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .header(header::CONTENT_TYPE, "application/json")
         .json(&body)
@@ -743,6 +821,10 @@ async fn call_anthropic_judge(client: &Client, config: &Config, prompt: &str) ->
 }
 
 async fn call_openai_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
+    let key = config
+        .openai_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("OPENAI_API_KEY"))?;
     let body = serde_json::json!({
         "model": config.judge_model,
         "messages": [{"role": "user", "content": prompt}],
@@ -750,7 +832,7 @@ async fn call_openai_judge(client: &Client, config: &Config, prompt: &str) -> Re
     });
     let resp = client
         .post("https://api.openai.com/v1/chat/completions")
-        .bearer_auth(&config.openai_key)
+        .bearer_auth(key)
         .header(header::CONTENT_TYPE, "application/json")
         .json(&body)
         .send()
@@ -760,6 +842,10 @@ async fn call_openai_judge(client: &Client, config: &Config, prompt: &str) -> Re
 }
 
 async fn call_grok_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
+    let key = config
+        .grok_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("GROK_API_KEY"))?;
     let body = serde_json::json!({
         "model": config.judge_model,
         "messages": [{"role": "user", "content": prompt}],
@@ -767,7 +853,7 @@ async fn call_grok_judge(client: &Client, config: &Config, prompt: &str) -> Resu
     });
     let resp = client
         .post("https://api.x.ai/v1/chat/completions")
-        .bearer_auth(&config.grok_key)
+        .bearer_auth(key)
         .header(header::CONTENT_TYPE, "application/json")
         .json(&body)
         .send()
@@ -777,9 +863,13 @@ async fn call_grok_judge(client: &Client, config: &Config, prompt: &str) -> Resu
 }
 
 async fn call_gemini_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
+    let key = config
+        .gemini_key
+        .as_ref()
+        .ok_or(ProviderError::MissingConfig("GEMINI_API_KEY"))?;
     let endpoint = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        config.judge_model, config.gemini_key
+        config.judge_model, key
     );
     let body = serde_json::json!({
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
