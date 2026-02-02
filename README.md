@@ -1,8 +1,8 @@
-# 🏟️ LLM Arena
+# ⚔️ TokenWar
 
 **Compare LLM responses side-by-side in your terminal, then let an AI judge score them.**
 
-LLM Arena sends the same prompt to multiple LLM providers simultaneously, displays their responses in a split-pane TUI, and runs an LLM-as-judge evaluation scoring each response on accuracy, helpfulness, clarity, creativity, and conciseness.
+TokenWar sends the same prompt to multiple LLM providers simultaneously, displays their responses in a split-pane TUI, and runs an LLM-as-judge evaluation scoring each response on accuracy, helpfulness, clarity, creativity, and conciseness.
 
 ```
 ┌─────────────────────┬──────────────────────┬─────────────────────┐
@@ -50,7 +50,7 @@ OpenAI:
   ...
 ```
 
-## Why LLM Arena?
+## Why TokenWar?
 
 ### When it's better than just using Claude or ChatGPT
 
@@ -100,12 +100,12 @@ OpenAI:
 ### Build
 
 ```bash
-git clone https://github.com/drfoxmd/llm-arena.git
-cd llm-arena
+git clone https://github.com/drfoxmd/tokenwar.git
+cd tokenwar
 cargo build --release
 ```
 
-The binary will be at `target/release/llm-arena`.
+The binary will be at `target/release/tokenwar`.
 
 ### Configuration
 
@@ -146,29 +146,29 @@ JUDGE_MODEL=claude-sonnet-4-20250514
 
 ```bash
 # Pass prompt as argument
-llm-arena "Explain the difference between TCP and UDP"
+tokenwar "Explain the difference between TCP and UDP"
 
 # Pipe from stdin
-echo "Write a haiku about Rust" | llm-arena
+echo "Write a haiku about Rust" | tokenwar
 
 # From a file
-llm-arena < prompt.txt
+tokenwar < prompt.txt
 ```
 
 ### Options
 
 ```bash
 # Stream responses as they arrive (token-by-token in TUI)
-llm-arena --stream "What is quantum computing?"
+tokenwar --stream "What is quantum computing?"
 
 # Plain text output (no TUI, good for scripts/CI)
-llm-arena --no-tui "Compare REST vs GraphQL"
+tokenwar --no-tui "Compare REST vs GraphQL"
 
 # Custom timeout (default: 60s)
-llm-arena --timeout-secs 120 "Write a detailed essay on climate change"
+tokenwar --timeout-secs 120 "Write a detailed essay on climate change"
 
 # Combine flags
-llm-arena --stream --timeout-secs 90 "Explain monads to a 5-year-old"
+tokenwar --stream --timeout-secs 90 "Explain monads to a 5-year-old"
 ```
 
 ### TUI Controls
@@ -182,7 +182,7 @@ The TUI automatically exits once all providers have responded, then displays the
 ### Example: Plain Text Output
 
 ```
-$ llm-arena --no-tui "What is the capital of France?"
+$ tokenwar --no-tui "What is the capital of France?"
 
 === Anthropic ===
 The capital of France is Paris...

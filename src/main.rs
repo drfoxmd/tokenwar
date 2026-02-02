@@ -26,7 +26,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
-#[command(name = "llm-arena", version, about = "Compare LLM responses side-by-side")]
+#[command(name = "tokenwar", version, about = "Compare LLM responses side-by-side")]
 struct Args {
     /// Prompt text (if omitted, read from stdin)
     prompt: Option<String>,
