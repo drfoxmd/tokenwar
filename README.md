@@ -54,7 +54,7 @@ OpenAI:
 
 ### When it's better than just using Claude or ChatGPT
 
-| Use Case | Why Arena Wins |
+| Use Case | Why TokenWar Wins |
 |----------|---------------|
 | **Evaluating models for your use case** | See how 5 models handle *your* actual prompts, not benchmarks |
 | **Reducing bias in model selection** | An independent judge scores responses — not your gut feeling |
@@ -65,18 +65,18 @@ OpenAI:
 | **Factual research** | Cross-reference answers across providers for higher confidence |
 | **Cost optimization** | If a cheaper model scores comparably, you've found your winner |
 
-**Example:** You're building a customer support bot. You write 10 representative prompts, run them through Arena, and discover that for *your specific domain*, Gemini outperforms GPT-4o while costing less. You'd never know this from public benchmarks.
+**Example:** You're building a customer support bot. You write 10 representative prompts, run them through TokenWar, and discover that for *your specific domain*, Gemini outperforms GPT-4o while costing less. You'd never know this from public benchmarks.
 
 ### When you should just use Claude or ChatGPT
 
-| Situation | Why Arena is Overkill |
+| Situation | Why TokenWar is Overkill |
 |-----------|----------------------|
 | **Quick one-off questions** | You just need an answer, not a comparison |
-| **Conversational/multi-turn chat** | Arena is single-turn only — no follow-ups |
+| **Conversational/multi-turn chat** | TokenWar is single-turn only — no follow-ups |
 | **You already know your preferred model** | No need to compare if you're happy |
-| **Cost-sensitive usage** | Arena calls 5 APIs + a judge = 6x the cost of one model |
-| **Image/audio/video tasks** | Arena is text-only |
-| **You need tool use or function calling** | Arena sends plain prompts, no tool schemas |
+| **Cost-sensitive usage** | TokenWar calls 5 APIs + a judge = 6x the cost of one model |
+| **Image/audio/video tasks** | TokenWar is text-only |
+| **You need tool use or function calling** | TokenWar sends plain prompts, no tool schemas |
 
 ## Features
 
@@ -86,6 +86,8 @@ OpenAI:
 - **🔌 5 providers** — Anthropic, OpenAI, Grok/xAI, Google Gemini, and any OpenAI-compatible API
 - **📡 Streaming mode** — Watch responses arrive token-by-token with `--stream`
 - **📋 Plain text mode** — `--no-tui` for piping output or CI/automation
+- **📊 JSON output** — `--json` for machine-readable results with latency data
+- **⏱️ Latency tracking** — Per-provider response time in milliseconds
 - **⏱️ Configurable timeout** — `--timeout-secs` to control how long to wait
 - **🔧 Fully configurable** — Models, judge provider, and judge model all set via `.env`
 - **💪 Fault tolerant** — One provider failing doesn't kill the others
@@ -164,11 +166,48 @@ tokenwar --stream "What is quantum computing?"
 # Plain text output (no TUI, good for scripts/CI)
 tokenwar --no-tui "Compare REST vs GraphQL"
 
+# JSON output (machine-readable, includes latency)
+tokenwar --json "Compare REST vs GraphQL"
+
 # Custom timeout (default: 60s)
 tokenwar --timeout-secs 120 "Write a detailed essay on climate change"
 
 # Combine flags
 tokenwar --stream --timeout-secs 90 "Explain monads to a 5-year-old"
+```
+
+### JSON Output
+
+The `--json` flag outputs structured JSON for programmatic consumption:
+
+```json
+{
+  "prompt": "What is 2+2?",
+  "timestamp": 1738492800,
+  "providers": [
+    {
+      "name": "Anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "response_text": "2 + 2 = 4.",
+      "error": null,
+      "latency_ms": 1234
+    },
+    {
+      "name": "OpenAI",
+      "model": "gpt-4o",
+      "response_text": "The answer is 4.",
+      "error": null,
+      "latency_ms": 987
+    }
+  ],
+  "judge_scores": {
+    "scores": [...]
+  },
+  "settings": {
+    "timeout_secs": 60,
+    "stream": false
+  }
+}
 ```
 
 ### TUI Controls
@@ -260,18 +299,20 @@ The judge evaluates each response on a 1-10 scale:
 - **Use a different judge provider** than the contestants to avoid self-preference bias (e.g., if comparing Anthropic vs OpenAI models, use Gemini as the judge)
 - **Run the same prompt multiple times** — LLM outputs are non-deterministic, so scores will vary
 - **The Generic slot is versatile** — point it at Ollama for local models, or any OpenAI-compatible API
-- **Use `--no-tui` for automation** — pipe output to files, parse scores programmatically
-- **Missing API keys are fatal** — if you don't have all 5 providers, the app will error. Comment out unused providers in the source, or set dummy keys (they'll return errors but won't crash the others)
+- **Use `--json` for automation** — pipe output to `jq`, parse scores programmatically, build dashboards
+- **Use `--no-tui` for simple text output** — pipe to files or grep through results
+- **Providers with missing keys are skipped** — you only need 2+ configured providers
 
 ## Roadmap
 
-- [ ] Gracefully skip providers with missing API keys
-- [ ] JSON output mode for programmatic consumption
+- [x] ~~JSON output mode for programmatic consumption~~
+- [x] ~~Provider latency comparison (total response time)~~
+- [x] ~~Gracefully skip providers with missing API keys~~
 - [ ] Multi-turn conversation support
 - [ ] Token usage and cost tracking per provider
 - [ ] Configurable scoring criteria
-- [ ] Export results to CSV/JSON
-- [ ] Provider latency comparison (time-to-first-token, total time)
+- [ ] Export results to CSV
+- [ ] Time-to-first-token latency tracking
 
 ## License
 
