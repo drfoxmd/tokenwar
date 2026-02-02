@@ -2,11 +2,11 @@
 
 **Compare LLM responses side-by-side in your terminal, then let an AI judge score them.**
 
-TokenWar sends the same prompt to multiple LLM providers simultaneously, displays their responses in a split-pane TUI, and runs an LLM-as-judge evaluation scoring each response on accuracy, helpfulness, clarity, creativity, and conciseness.
+TokenWar sends the same prompt to multiple LLM models via an OpenAI-compatible endpoint, displays their responses in a split-pane TUI, and runs an LLM-as-judge evaluation scoring each response on accuracy, helpfulness, clarity, creativity, and conciseness.
 
 ```
 ┌─────────────────────┬──────────────────────┬─────────────────────┐
-│ Anthropic           │ OpenAI               │ Grok (xAI)          │
+│ claude-sonnet-4     │ gpt-4o               │ grok-3              │
 │                     │                      │                     │
 │ The Rust ownership  │ Rust's ownership     │ In Rust, ownership  │
 │ system ensures      │ model is a set of    │ is the core concept │
@@ -15,7 +15,7 @@ TokenWar sends the same prompt to multiple LLM providers simultaneously, display
 │ collector...        │ compile time...      │                     │
 │                     │                      │                     │
 ├─────────────────────┴───────────┬──────────┴─────────────────────┤
-│ Gemini                          │ Generic                        │
+│ gemini-2.5-flash                │ llama-3.1-70b                  │
 │                                 │                                │
 │ Ownership in Rust is a          │ Rust uses an ownership model   │
 │ discipline enforced by the      │ where each value has exactly   │
@@ -29,22 +29,22 @@ After all responses arrive, the judge scores them:
 
 ```
 === Scoreboard ===
-1. Anthropic - 42.0/50
-2. Gemini - 40.5/50
-3. OpenAI - 39.0/50
-4. Grok (xAI) - 38.5/50
-5. Generic - 37.0/50
+1. claude-sonnet-4 - 42.0/50
+2. gemini-2.5-flash - 40.5/50
+3. gpt-4o - 39.0/50
+4. grok-3 - 38.5/50
+5. llama-3.1-70b - 37.0/50
 
 === Details ===
 
-Anthropic:
+claude-sonnet-4:
   Accuracy: 9.0 (Correct and precise explanation of ownership rules)
   Helpfulness: 8.5 (Directly addresses the question with practical examples)
   Clarity: 8.5 (Well-structured with clear progression of concepts)
   Creativity: 8.0 (Novel analogy comparing ownership to real-world lending)
   Conciseness: 8.0 (Thorough but not verbose)
 
-OpenAI:
+gpt-4o:
   Accuracy: 8.5 (Accurate coverage of core concepts)
   Helpfulness: 8.0 (Good overview but fewer practical examples)
   ...
@@ -56,16 +56,16 @@ OpenAI:
 
 | Use Case | Why TokenWar Wins |
 |----------|---------------|
-| **Evaluating models for your use case** | See how 5 models handle *your* actual prompts, not benchmarks |
+| **Evaluating models for your use case** | See how multiple models handle *your* actual prompts, not benchmarks |
 | **Reducing bias in model selection** | An independent judge scores responses — not your gut feeling |
 | **Catching hallucinations** | If 4 models agree and 1 doesn't, you've found a hallucination |
 | **Prompt engineering** | Instantly see how different models interpret the same prompt |
-| **Choosing a provider for production** | Real response quality + latency data, not marketing claims |
-| **Creative work** | Compare writing styles, get 5 different angles on the same topic |
-| **Factual research** | Cross-reference answers across providers for higher confidence |
+| **Choosing a model for production** | Real response quality + latency data, not marketing claims |
+| **Creative work** | Compare writing styles, get multiple angles on the same topic |
+| **Factual research** | Cross-reference answers across models for higher confidence |
 | **Cost optimization** | If a cheaper model scores comparably, you've found your winner |
 
-**Example:** You're building a customer support bot. You write 10 representative prompts, run them through TokenWar, and discover that for *your specific domain*, Gemini outperforms GPT-4o while costing less. You'd never know this from public benchmarks.
+**Example:** You're building a customer support bot. You write 10 representative prompts, run them through TokenWar, and discover that for *your specific domain*, gemini-2.5-flash outperforms gpt-4o while costing less. You'd never know this from public benchmarks.
 
 ### When you should just use Claude or ChatGPT
 
@@ -74,30 +74,30 @@ OpenAI:
 | **Quick one-off questions** | You just need an answer, not a comparison |
 | **Conversational/multi-turn chat** | TokenWar is single-turn only — no follow-ups |
 | **You already know your preferred model** | No need to compare if you're happy |
-| **Cost-sensitive usage** | TokenWar calls 5 APIs + a judge = 6x the cost of one model |
+| **Cost-sensitive usage** | TokenWar calls N models + a judge = (N+1)x the cost of one model |
 | **Image/audio/video tasks** | TokenWar is text-only |
 | **You need tool use or function calling** | TokenWar sends plain prompts, no tool schemas |
 
 ## Features
 
-- **⚡ Concurrent API calls** — All providers queried simultaneously via tokio, not sequentially
+- **⚡ Concurrent API calls** — All models queried simultaneously via tokio, not sequentially
 - **📺 Terminal UI** — Split-pane ratatui display showing responses as they stream in
 - **🏆 LLM-as-judge scoring** — Automated evaluation on 5 criteria (1-10 scale each, 50 max)
-- **🔌 5 providers** — Anthropic, OpenAI, Grok/xAI, Google Gemini, and any OpenAI-compatible API
+- **🔌 Dynamic model list** — Compare any set of models via a single OpenAI-compatible endpoint
 - **📡 Streaming mode** — Watch responses arrive token-by-token with `--stream`
 - **📋 Plain text mode** — `--no-tui` for piping output or CI/automation
 - **📊 JSON output** — `--json` for machine-readable results with latency data
-- **⏱️ Latency tracking** — Per-provider response time in milliseconds
+- **⏱️ Latency tracking** — Per-model response time in milliseconds
 - **⏱️ Configurable timeout** — `--timeout-secs` to control how long to wait
-- **🔧 Fully configurable** — Models, judge provider, and judge model all set via `.env`
-- **💪 Fault tolerant** — One provider failing doesn't kill the others
+- **🔧 Fully configurable** — Models and judge model set via `.env`
+- **💪 Fault tolerant** — One model failing doesn't kill the others
 
 ## Installation
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (1.70+)
-- API keys for at least 2 providers (the more the merrier)
+- API key for an OpenAI-compatible endpoint and at least 2 models to compare
 
 ### Build
 
@@ -120,27 +120,23 @@ cp .env.example .env
 Edit `.env`:
 
 ```env
-# Required: at least set the providers you want to use
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-4-20250514
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o
-GROK_API_KEY=xai-...
-GROK_MODEL=grok-3
-GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-2.5-flash
+# Base URL for the OpenAI-compatible proxy (LiteLLM, OpenRouter, etc.)
+BASE_URL=http://localhost:4000/v1
+API_KEY=sk-litellm-xxx
 
-# Optional: any OpenAI-compatible API (e.g., Ollama, Together, Groq)
-GENERIC_API_KEY=sk-...
-GENERIC_MODEL=llama-3.1-70b
-GENERIC_API_URL=https://api.together.xyz/v1/chat/completions
+# Comma-separated list of model names to compare (min 2)
+MODELS=claude-sonnet-4-20250514,gpt-4o,grok-3,gemini-2.5-flash
 
-# Judge configuration (which provider/model evaluates the responses)
-JUDGE_PROVIDER=anthropic
+# Judge config (still separate)
 JUDGE_MODEL=claude-sonnet-4-20250514
+
+# Optional per-model overrides (if some models need a different endpoint/key)
+# MODEL_0_BASE_URL=https://api.openai.com/v1
+# MODEL_0_API_KEY=sk-xxx
+# MODEL_0_NAME=Claude Sonnet 4
 ```
 
-> **Tip:** The Generic slot accepts any OpenAI-compatible API. Use it for Ollama (`http://localhost:11434/v1/chat/completions`), Together AI, Groq, Fireworks, or your own endpoint.
+> **Tip:** Point `BASE_URL` at LiteLLM, OpenRouter, Ollama, or any OpenAI-compatible proxy.
 
 ## Usage
 
@@ -183,27 +179,27 @@ The `--json` flag outputs structured JSON for programmatic consumption:
 ```json
 {
   "prompt": "What is 2+2?",
-  "timestamp": 1738492800,
   "providers": [
     {
-      "name": "Anthropic",
+      "name": "claude-sonnet-4-20250514",
       "model": "claude-sonnet-4-20250514",
       "response_text": "2 + 2 = 4.",
       "error": null,
       "latency_ms": 1234
     },
     {
-      "name": "OpenAI",
+      "name": "gpt-4o",
       "model": "gpt-4o",
       "response_text": "The answer is 4.",
       "error": null,
       "latency_ms": 987
     }
   ],
-  "judge_scores": {
-    "scores": [...]
+  "scores": {
+    "scores": []
   },
-  "settings": {
+  "metadata": {
+    "timestamp": 1738492800,
     "timeout_secs": 60,
     "stream": false
   }
@@ -216,34 +212,34 @@ The `--json` flag outputs structured JSON for programmatic consumption:
 |-----|--------|
 | `q` | Quit early (skips waiting for remaining responses) |
 
-The TUI automatically exits once all providers have responded, then displays the judge scoreboard.
+The TUI automatically exits once all models have responded, then displays the judge scoreboard.
 
 ### Example: Plain Text Output
 
 ```
 $ tokenwar --no-tui "What is the capital of France?"
 
-=== Anthropic ===
+=== claude-sonnet-4 ===
 The capital of France is Paris...
 
-=== OpenAI ===
+=== gpt-4o ===
 Paris is the capital of France...
 
-=== Grok (xAI) ===
+=== grok-3 ===
 The capital of France is Paris...
 
-=== Gemini ===
+=== gemini-2.5-flash ===
 Paris is the capital city of France...
 
-=== Generic ===
+=== llama-3.1-70b ===
 The capital of France is Paris...
 
 === Scoreboard ===
-1. Anthropic - 43.0/50
-2. Gemini - 42.0/50
-3. OpenAI - 41.5/50
-4. Grok (xAI) - 40.0/50
-5. Generic - 39.5/50
+1. claude-sonnet-4 - 43.0/50
+2. gemini-2.5-flash - 42.0/50
+3. gpt-4o - 41.5/50
+4. grok-3 - 40.0/50
+5. llama-3.1-70b - 39.5/50
 
 === Details ===
 ...
@@ -252,28 +248,21 @@ The capital of France is Paris...
 ## Architecture
 
 ```
-                    ┌──────────┐
-          prompt    │          │
-       ┌───────────▶│ Anthropic │──────┐
-       │            │          │      │
-       │            └──────────┘      │
-       │            ┌──────────┐      │
-       │───────────▶│  OpenAI  │──────│
-       │            └──────────┘      │
-┌──────┴──┐         ┌──────────┐      │     ┌───────────┐     ┌────────────┐
-│  User   │────────▶│   Grok   │──────┼────▶│    TUI    │────▶│   Judge    │
-│ Prompt  │         └──────────┘      │     │  Display  │     │  Scoring   │
-└─────────┘         ┌──────────┐      │     └───────────┘     └────────────┘
-       │───────────▶│  Gemini  │──────│
-       │            └──────────┘      │
-       │            ┌──────────┐      │
-       └───────────▶│ Generic  │──────┘
-                    └──────────┘
+                    ┌─────────────────────────────┐
+          prompt    │ OpenAI-compatible endpoint │
+       ┌───────────▶│ (LiteLLM, OpenRouter, etc.)│────┐
+       │            └─────────────────────────────┘    │
+┌──────┴──┐         ┌──────────┐  ┌──────────┐         │     ┌───────────┐     ┌────────────┐
+│  User   │────────▶│ Model A  │  │ Model B  │─────────┼────▶│    TUI    │────▶│   Judge    │
+│ Prompt  │         └──────────┘  └──────────┘         │     │  Display  │     │  Scoring   │
+└─────────┘         ┌──────────┐  ┌──────────┐         │     └───────────┘     └────────────┘
+       │───────────▶│ Model C  │  │ Model D  │─────────┘
+                    └──────────┘  └──────────┘
 
                     All calls are concurrent (tokio async)
 ```
 
-1. **Dispatch** — Your prompt is sent to all configured providers simultaneously
+1. **Dispatch** — Your prompt is sent to all configured models simultaneously
 2. **Collect** — Responses stream back via mpsc channels and render in the TUI
 3. **Judge** — All responses are sent to the judge model for structured scoring
 4. **Report** — Scoreboard with rankings and per-criteria reasoning
@@ -292,24 +281,24 @@ The judge evaluates each response on a 1-10 scale:
 
 **Total: /50** — The judge also provides brief reasoning for each score.
 
-> **Note:** The judge itself is an LLM, so scores have inherent subjectivity. For best results, use a strong model (Claude Sonnet, GPT-4o) as the judge, and ideally a different provider than the contestants to reduce self-preference bias.
+> **Note:** The judge itself is an LLM, so scores have inherent subjectivity. For best results, use a strong model (Claude Sonnet, GPT-4o) as the judge, and ideally a different model than the contestants to reduce self-preference bias.
 
 ## Tips
 
-- **Use a different judge provider** than the contestants to avoid self-preference bias (e.g., if comparing Anthropic vs OpenAI models, use Gemini as the judge)
+- **Use a different judge model** than the contestants to reduce self-preference bias
 - **Run the same prompt multiple times** — LLM outputs are non-deterministic, so scores will vary
-- **The Generic slot is versatile** — point it at Ollama for local models, or any OpenAI-compatible API
+- **Point `BASE_URL` at any OpenAI-compatible proxy** — LiteLLM, OpenRouter, Ollama, or your own endpoint
 - **Use `--json` for automation** — pipe output to `jq`, parse scores programmatically, build dashboards
 - **Use `--no-tui` for simple text output** — pipe to files or grep through results
-- **Providers with missing keys are skipped** — you only need 2+ configured providers
+- **Ensure 2+ models in `MODELS`** — TokenWar validates this on startup
 
 ## Roadmap
 
 - [x] ~~JSON output mode for programmatic consumption~~
-- [x] ~~Provider latency comparison (total response time)~~
-- [x] ~~Gracefully skip providers with missing API keys~~
+- [x] ~~Model latency comparison (total response time)~~
+- [x] ~~Gracefully skip models with missing API keys~~
 - [ ] Multi-turn conversation support
-- [ ] Token usage and cost tracking per provider
+- [ ] Token usage and cost tracking per model
 - [ ] Configurable scoring criteria
 - [ ] Export results to CSV
 - [ ] Time-to-first-token latency tracking

@@ -22,11 +22,14 @@ use std::{
     io::{self, Read},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use thiserror::Error;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
-#[command(name = "tokenwar", version, about = "Compare LLM responses side-by-side")]
+#[command(
+    name = "tokenwar",
+    version,
+    about = "Compare LLM responses side-by-side"
+)]
 struct Args {
     /// Prompt text (if omitted, read from stdin)
     prompt: Option<String>,
@@ -45,49 +48,19 @@ struct Args {
 }
 
 #[derive(Clone, Debug)]
-struct Config {
-    anthropic_key: Option<String>,
-    anthropic_model: Option<String>,
-    openai_key: Option<String>,
-    openai_model: Option<String>,
-    grok_key: Option<String>,
-    grok_model: Option<String>,
-    gemini_key: Option<String>,
-    gemini_model: Option<String>,
-    generic_key: Option<String>,
-    generic_model: Option<String>,
-    generic_url: Option<String>,
-    judge_provider: String,
-    judge_model: String,
+struct ModelConfig {
+    name: String,
+    model: String,
+    base_url: String,
+    api_key: String,
 }
 
 #[derive(Clone, Debug)]
-enum Provider {
-    Anthropic,
-    OpenAI,
-    Grok,
-    Gemini,
-    Generic,
-}
-
-impl Provider {
-    fn name(&self) -> &'static str {
-        match self {
-            Provider::Anthropic => "Anthropic",
-            Provider::OpenAI => "OpenAI",
-            Provider::Grok => "Grok (xAI)",
-            Provider::Gemini => "Gemini",
-            Provider::Generic => "Generic",
-        }
-    }
-}
-
-#[derive(Error, Debug)]
-enum ProviderError {
-    #[error("missing configuration: {0}")]
-    MissingConfig(&'static str),
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+struct Config {
+    models: Vec<ModelConfig>,
+    judge_model: String,
+    judge_base_url: String,
+    judge_api_key: String,
 }
 
 #[derive(Debug)]
@@ -101,7 +74,7 @@ struct ProviderUpdate {
 
 #[derive(Clone, Debug)]
 struct ProviderResult {
-    provider: Provider,
+    model: ModelConfig,
     text: String,
     error: Option<String>,
     latency: Option<Duration>,
@@ -148,7 +121,7 @@ struct ScoreItem {
 const JUDGE_SCHEMA_EXAMPLE: &str = r#"{
   "scores": [
     {
-      "provider": "OpenAI",
+      "provider": "gpt-4o",
       "accuracy": { "score": 8.5, "reasoning": "Mostly correct." },
       "helpfulness": { "score": 8.0, "reasoning": "Addresses the request." },
       "clarity": { "score": 7.5, "reasoning": "Readable and structured." },
@@ -208,31 +181,17 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(args.timeout_secs))
         .build()?;
 
-    let providers = configured_providers(&config);
-    if providers.len() < 2 {
-        return Err(anyhow!(
-            "need at least 2 configured providers; set at least two API keys and models (e.g. ANTHROPIC_API_KEY + ANTHROPIC_MODEL)"
-        ));
-    }
-
     let (tx, rx) = mpsc::channel::<ProviderUpdate>(128);
     let mut handles = Vec::new();
 
-    for (index, provider) in providers.iter().cloned().enumerate() {
+    for (index, model) in config.models.iter().cloned().enumerate() {
         let tx = tx.clone();
         let client = client.clone();
-        let config = config.clone();
         let prompt = prompt.clone();
         let stream = args.stream;
         let handle = tokio::spawn(async move {
             let start = Instant::now();
-            let result = match provider {
-                Provider::Anthropic => call_anthropic(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::OpenAI => call_openai(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::Grok => call_grok(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::Gemini => call_gemini(&client, &config, &prompt, stream, index, tx.clone()).await,
-                Provider::Generic => call_generic(&client, &config, &prompt, stream, index, tx.clone()).await,
-            };
+            let result = call_model(&client, &model, &prompt, stream, index, tx.clone()).await;
             if let Err(err) = result {
                 let _ = tx
                     .send(ProviderUpdate {
@@ -249,11 +208,12 @@ async fn main() -> Result<()> {
     }
     drop(tx);
 
-    let mut results = providers
+    let mut results = config
+        .models
         .iter()
         .cloned()
-        .map(|provider| ProviderResult {
-            provider,
+        .map(|model| ProviderResult {
+            model,
             text: String::new(),
             error: None,
             latency: None,
@@ -281,14 +241,8 @@ async fn main() -> Result<()> {
         let providers = results
             .iter()
             .map(|result| JsonProvider {
-                name: result.provider.name().to_string(),
-                model: match result.provider {
-                    Provider::Anthropic => config.anthropic_model.clone(),
-                    Provider::OpenAI => config.openai_model.clone(),
-                    Provider::Grok => config.grok_model.clone(),
-                    Provider::Gemini => config.gemini_model.clone(),
-                    Provider::Generic => config.generic_model.clone(),
-                },
+                name: result.model.name.clone(),
+                model: Some(result.model.model.clone()),
                 response_text: result.text.trim().to_string(),
                 error: result.error.clone(),
                 latency_ms: result.latency.map(|latency| latency.as_millis() as u64),
@@ -314,44 +268,79 @@ async fn main() -> Result<()> {
 }
 
 fn load_config() -> Result<Config> {
+    let base_url = env::var("BASE_URL")
+        .map_err(|_| anyhow!("BASE_URL is required (e.g. http://localhost:4000/v1)"))?;
+    let api_key = env::var("API_KEY").map_err(|_| anyhow!("API_KEY is required"))?;
+    if base_url.trim().is_empty() {
+        return Err(anyhow!("BASE_URL is empty"));
+    }
+    if api_key.trim().is_empty() {
+        return Err(anyhow!("API_KEY is empty"));
+    }
+    let models_raw = env::var("MODELS")
+        .map_err(|_| anyhow!("MODELS is required (comma-separated model list)"))?;
+
+    let models_list = models_raw
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+
+    if models_list.len() < 2 {
+        return Err(anyhow!(
+            "need at least 2 configured models; set MODELS with two or more entries"
+        ));
+    }
+
+    let mut models = Vec::with_capacity(models_list.len());
+    for (idx, model) in models_list.into_iter().enumerate() {
+        let name_key = format!("MODEL_{}_NAME", idx);
+        let base_key = format!("MODEL_{}_BASE_URL", idx);
+        let api_key_var = format!("MODEL_{}_API_KEY", idx);
+
+        let name = env::var(&name_key).unwrap_or_else(|_| model.clone());
+        let model_base_url = env::var(&base_key).unwrap_or_else(|_| base_url.clone());
+        let model_api_key = env::var(&api_key_var).unwrap_or_else(|_| api_key.clone());
+
+        if model_base_url.trim().is_empty() {
+            return Err(anyhow!("{} is empty", base_key));
+        }
+        if model_api_key.trim().is_empty() {
+            return Err(anyhow!("{} is empty", api_key_var));
+        }
+
+        models.push(ModelConfig {
+            name,
+            model,
+            base_url: model_base_url,
+            api_key: model_api_key,
+        });
+    }
+
+    let judge_model = env::var("JUDGE_MODEL").map_err(|_| anyhow!("JUDGE_MODEL is required"))?;
+    let judge_base_url = env::var("JUDGE_BASE_URL").unwrap_or(base_url);
+    let judge_api_key = env::var("JUDGE_API_KEY").unwrap_or(api_key);
+
+    if judge_base_url.trim().is_empty() {
+        return Err(anyhow!("JUDGE_BASE_URL is empty"));
+    }
+    if judge_api_key.trim().is_empty() {
+        return Err(anyhow!("JUDGE_API_KEY is empty"));
+    }
+
     Ok(Config {
-        anthropic_key: env::var("ANTHROPIC_API_KEY").ok(),
-        anthropic_model: env::var("ANTHROPIC_MODEL").ok(),
-        openai_key: env::var("OPENAI_API_KEY").ok(),
-        openai_model: env::var("OPENAI_MODEL").ok(),
-        grok_key: env::var("GROK_API_KEY").ok(),
-        grok_model: env::var("GROK_MODEL").ok(),
-        gemini_key: env::var("GEMINI_API_KEY").ok(),
-        gemini_model: env::var("GEMINI_MODEL").ok(),
-        generic_key: env::var("GENERIC_API_KEY").ok(),
-        generic_model: env::var("GENERIC_MODEL").ok(),
-        generic_url: env::var("GENERIC_API_URL").ok(),
-        judge_provider: env::var("JUDGE_PROVIDER").unwrap_or_else(|_| "anthropic".to_string()),
-        judge_model: env::var("JUDGE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
+        models,
+        judge_model,
+        judge_base_url,
+        judge_api_key,
     })
 }
 
-fn configured_providers(config: &Config) -> Vec<Provider> {
-    let mut providers = Vec::new();
-    if config.anthropic_key.is_some() && config.anthropic_model.is_some() {
-        providers.push(Provider::Anthropic);
-    }
-    if config.openai_key.is_some() && config.openai_model.is_some() {
-        providers.push(Provider::OpenAI);
-    }
-    if config.grok_key.is_some() && config.grok_model.is_some() {
-        providers.push(Provider::Grok);
-    }
-    if config.gemini_key.is_some() && config.gemini_model.is_some() {
-        providers.push(Provider::Gemini);
-    }
-    if config.generic_key.is_some() && config.generic_model.is_some() && config.generic_url.is_some() {
-        providers.push(Provider::Generic);
-    }
-    providers
-}
-
-async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult], print_output: bool) -> Result<()> {
+async fn collect_plain(
+    mut rx: mpsc::Receiver<ProviderUpdate>,
+    results: &mut [ProviderResult],
+    print_output: bool,
+) -> Result<()> {
     while let Some(update) = rx.recv().await {
         let entry = &mut results[update.index];
         if let Some(chunk) = update.append {
@@ -365,7 +354,7 @@ async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Pr
         }
         if update.done {
             if print_output {
-                let label = entry.provider.name();
+                let label = entry.model.name.as_str();
                 println!("\n=== {} ===", label);
                 if let Some(err) = &entry.error {
                     println!("Error: {}", err);
@@ -378,7 +367,10 @@ async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Pr
     Ok(())
 }
 
-async fn run_tui(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult]) -> Result<()> {
+async fn run_tui(
+    mut rx: mpsc::Receiver<ProviderUpdate>,
+    results: &mut [ProviderResult],
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -407,63 +399,14 @@ async fn run_tui(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Provider
 
         terminal.draw(|f| {
             let size = f.size();
-            match results.len() {
-                0 => {}
-                1 => render_panel(f, size, &results[0]),
-                2 => {
-                    let chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(size);
-                    render_panel(f, chunks[0], &results[0]);
-                    render_panel(f, chunks[1], &results[1]);
-                }
-                3 => {
-                    let chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
-                        .split(size);
-                    render_panel(f, chunks[0], &results[0]);
-                    render_panel(f, chunks[1], &results[1]);
-                    render_panel(f, chunks[2], &results[2]);
-                }
-                4 => {
-                    let rows = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(size);
-                    let top = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(rows[0]);
-                    let bottom = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(rows[1]);
-                    render_panel(f, top[0], &results[0]);
-                    render_panel(f, top[1], &results[1]);
-                    render_panel(f, bottom[0], &results[2]);
-                    render_panel(f, bottom[1], &results[3]);
-                }
-                _ => {
-                    let rows = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                        .split(size);
-                    let top = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
-                        .split(rows[0]);
-                    let bottom = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(rows[1]);
+            if results.is_empty() {
+                return;
+            }
 
-                    render_panel(f, top[0], &results[0]);
-                    render_panel(f, top[1], &results[1]);
-                    render_panel(f, top[2], &results[2]);
-                    render_panel(f, bottom[0], &results[3]);
-                    render_panel(f, bottom[1], &results[4]);
+            let panels = layout_panels(size, results.len());
+            for (idx, rect) in panels.into_iter().enumerate() {
+                if let Some(result) = results.get(idx) {
+                    render_panel(f, rect, result);
                 }
             }
         })?;
@@ -486,11 +429,67 @@ async fn run_tui(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Provider
     Ok(())
 }
 
+fn layout_panels(area: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if count == 1 {
+        return vec![area];
+    }
+    if count == 2 {
+        return Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(equal_constraints(2))
+            .split(area)
+            .iter()
+            .copied()
+            .collect();
+    }
+
+    let columns = (count as f64).sqrt().ceil() as usize;
+    let rows = (count + columns - 1) / columns;
+    let row_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(equal_constraints(rows))
+        .split(area);
+
+    let mut panels = Vec::with_capacity(count);
+    for &row in row_chunks.iter() {
+        let col_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(equal_constraints(columns))
+            .split(row);
+        for &col in col_chunks.iter() {
+            if panels.len() >= count {
+                break;
+            }
+            panels.push(col);
+        }
+        if panels.len() >= count {
+            break;
+        }
+    }
+
+    panels
+}
+
+fn equal_constraints(count: usize) -> Vec<Constraint> {
+    let count = count.max(1);
+    let base = 100u16 / count as u16;
+    let remainder = 100u16 % count as u16;
+    (0..count)
+        .map(|idx| {
+            let extra = if (idx as u16) < remainder { 1 } else { 0 };
+            Constraint::Percentage(base + extra)
+        })
+        .collect()
+}
+
 fn render_panel(f: &mut ratatui::Frame, area: Rect, result: &ProviderResult) {
     let title = if let Some(_err) = &result.error {
-        format!("{} (error)", result.provider.name())
+        format!("{} (error)", result.model.name)
     } else {
-        result.provider.name().to_string()
+        result.model.name.clone()
     };
     let mut text = result.text.trim().to_string();
     if let Some(err) = &result.error {
@@ -505,35 +504,63 @@ fn render_panel(f: &mut ratatui::Frame, area: Rect, result: &ProviderResult) {
     f.render_widget(paragraph, area);
 }
 
-async fn call_anthropic(
+async fn call_model(
     client: &Client,
-    config: &Config,
+    model: &ModelConfig,
     prompt: &str,
     stream: bool,
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
     let start = Instant::now();
-    let key = config
-        .anthropic_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("ANTHROPIC_API_KEY"))?;
-    let model = config
-        .anthropic_model
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("ANTHROPIC_MODEL"))?;
+    let _ = call_openai_like(
+        client,
+        &model.base_url,
+        &model.api_key,
+        &model.model,
+        prompt,
+        0.7,
+        stream,
+        Some((index, tx.clone())),
+    )
+    .await?;
+    let _ = tx
+        .send(ProviderUpdate {
+            index,
+            append: None,
+            done: true,
+            error: None,
+            latency: Some(start.elapsed()),
+        })
+        .await;
+    Ok(())
+}
+
+async fn call_openai_like(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    temperature: f64,
+    stream: bool,
+    tx: Option<(usize, mpsc::Sender<ProviderUpdate>)>,
+) -> Result<String> {
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
         "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
         "stream": stream,
     });
+
+    let url = chat_completions_url(base_url);
     let req = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", key)
-        .header("anthropic-version", "2023-06-01")
+        .post(url)
+        .bearer_auth(api_key)
         .header(header::CONTENT_TYPE, "application/json")
         .json(&body);
+
+    let mut collected = String::new();
 
     if stream {
         let resp = req.send().await?;
@@ -547,11 +574,12 @@ async fn call_anthropic(
                         continue;
                     }
                     if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        if value["type"] == "content_block_delta" {
-                            if let Some(delta) = value["delta"]["text"].as_str() {
-                                let _ = tx
+                        if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+                            collected.push_str(delta);
+                            if let Some((index, sender)) = &tx {
+                                let _ = sender
                                     .send(ProviderUpdate {
-                                        index,
+                                        index: *index,
                                         append: Some(delta.to_string()),
                                         done: false,
                                         error: None,
@@ -567,296 +595,46 @@ async fn call_anthropic(
     } else {
         let resp = req.send().await?;
         let value: Value = resp.json().await?;
-        let text = value["content"]
-            .get(0)
-            .and_then(|v| v["text"].as_str())
-            .unwrap_or("")
-            .to_string();
-        let _ = tx
-            .send(ProviderUpdate {
-                index,
-                append: Some(text),
-                done: false,
-                error: None,
-                latency: None,
-            })
-            .await;
-    }
-
-    let _ = tx
-        .send(ProviderUpdate {
-            index,
-            append: None,
-            done: true,
-            error: None,
-            latency: Some(start.elapsed()),
-        })
-        .await;
-    Ok(())
-}
-
-async fn call_openai(
-    client: &Client,
-    config: &Config,
-    prompt: &str,
-    stream: bool,
-    index: usize,
-    tx: mpsc::Sender<ProviderUpdate>,
-) -> Result<()> {
-    let key = config
-        .openai_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("OPENAI_API_KEY"))?;
-    let model = config
-        .openai_model
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("OPENAI_MODEL"))?;
-    call_openai_like(
-        client,
-        key,
-        "https://api.openai.com/v1/chat/completions",
-        model,
-        prompt,
-        stream,
-        index,
-        tx,
-    )
-    .await
-}
-
-async fn call_grok(
-    client: &Client,
-    config: &Config,
-    prompt: &str,
-    stream: bool,
-    index: usize,
-    tx: mpsc::Sender<ProviderUpdate>,
-) -> Result<()> {
-    let key = config
-        .grok_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GROK_API_KEY"))?;
-    let model = config
-        .grok_model
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GROK_MODEL"))?;
-    call_openai_like(
-        client,
-        key,
-        "https://api.x.ai/v1/chat/completions",
-        model,
-        prompt,
-        stream,
-        index,
-        tx,
-    )
-    .await
-}
-
-async fn call_generic(
-    client: &Client,
-    config: &Config,
-    prompt: &str,
-    stream: bool,
-    index: usize,
-    tx: mpsc::Sender<ProviderUpdate>,
-) -> Result<()> {
-    let key = config
-        .generic_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GENERIC_API_KEY"))?;
-    let model = config
-        .generic_model
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GENERIC_MODEL"))?;
-    let url = config
-        .generic_url
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GENERIC_API_URL"))?;
-
-    call_openai_like(client, key, url, model, prompt, stream, index, tx).await
-}
-
-async fn call_openai_like(
-    client: &Client,
-    api_key: &str,
-    url: &str,
-    model: &str,
-    prompt: &str,
-    stream: bool,
-    index: usize,
-    tx: mpsc::Sender<ProviderUpdate>,
-) -> Result<()> {
-    let start = Instant::now();
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7,
-        "stream": stream,
-    });
-
-    let req = client
-        .post(url)
-        .bearer_auth(api_key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body);
-
-    if stream {
-        let resp = req.send().await?;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
-                            let _ = tx
-                                .send(ProviderUpdate {
-                                    index,
-                                    append: Some(delta.to_string()),
-                                    done: false,
-                                    error: None,
-                                    latency: None,
-                                })
-                                .await;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        let resp = req.send().await?;
-        let value: Value = resp.json().await?;
         let text = value["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
             .to_string();
-        let _ = tx
-            .send(ProviderUpdate {
-                index,
-                append: Some(text),
-                done: false,
-                error: None,
-                latency: None,
-            })
-            .await;
+        collected.push_str(&text);
+        if let Some((index, sender)) = &tx {
+            let _ = sender
+                .send(ProviderUpdate {
+                    index: *index,
+                    append: Some(text),
+                    done: false,
+                    error: None,
+                    latency: None,
+                })
+                .await;
+        }
     }
 
-    let _ = tx
-        .send(ProviderUpdate {
-            index,
-            append: None,
-            done: true,
-            error: None,
-            latency: Some(start.elapsed()),
-        })
-        .await;
-    Ok(())
+    Ok(collected)
 }
 
-async fn call_gemini(
+fn chat_completions_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{}/chat/completions", trimmed)
+    }
+}
+
+async fn run_judge(
     client: &Client,
     config: &Config,
     prompt: &str,
-    stream: bool,
-    index: usize,
-    tx: mpsc::Sender<ProviderUpdate>,
-) -> Result<()> {
-    let start = Instant::now();
-    let key = config
-        .gemini_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GEMINI_API_KEY"))?;
-    let model = config
-        .gemini_model
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GEMINI_MODEL"))?;
-    let endpoint = if stream {
-        format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}",
-            model, key
-        )
-    } else {
-        format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, key
-        )
-    };
-
-    let body = serde_json::json!({
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
-    });
-
-    let req = client
-        .post(endpoint)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body);
-
-    if stream {
-        let resp = req.send().await?;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(value) = serde_json::from_str::<Value>(line) {
-                    if let Some(part) = value["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-                        let _ = tx
-                            .send(ProviderUpdate {
-                                index,
-                                append: Some(part.to_string()),
-                                done: false,
-                                error: None,
-                                latency: None,
-                            })
-                            .await;
-                    }
-                }
-            }
-        }
-    } else {
-        let resp = req.send().await?;
-        let value: Value = resp.json().await?;
-        let text = value["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let _ = tx
-            .send(ProviderUpdate {
-                index,
-                append: Some(text),
-                done: false,
-                error: None,
-                latency: None,
-            })
-            .await;
-    }
-
-    let _ = tx
-        .send(ProviderUpdate {
-            index,
-            append: None,
-            done: true,
-            error: None,
-            latency: Some(start.elapsed()),
-        })
-        .await;
-    Ok(())
-}
-
-async fn run_judge(client: &Client, config: &Config, prompt: &str, results: &[ProviderResult]) -> Result<JudgeScores> {
+    results: &[ProviderResult],
+) -> Result<JudgeScores> {
     let responses = results
         .iter()
         .map(|r| JudgeResponse {
-            provider: r.provider.name(),
+            provider: r.model.name.as_str(),
             response: if r.error.is_some() {
                 "ERROR"
             } else {
@@ -893,14 +671,17 @@ fn build_judge_prompt(prompt: &str, payload: &JudgeRequest<'_>, retry: bool) -> 
 }
 
 async fn call_judge_with_prompt(client: &Client, config: &Config, prompt: &str) -> Result<String> {
-    match config.judge_provider.as_str() {
-        "anthropic" => call_anthropic_judge(client, config, prompt).await,
-        "openai" => call_openai_judge(client, config, prompt).await,
-        "grok" => call_grok_judge(client, config, prompt).await,
-        "gemini" => call_gemini_judge(client, config, prompt).await,
-        "generic" => call_generic_judge(client, config, prompt).await,
-        other => Err(anyhow!("unsupported JUDGE_PROVIDER: {}", other)),
-    }
+    call_openai_like(
+        client,
+        &config.judge_base_url,
+        &config.judge_api_key,
+        &config.judge_model,
+        prompt,
+        0.2,
+        false,
+        None,
+    )
+    .await
 }
 
 fn parse_judge_scores(text: &str) -> Result<JudgeScores> {
@@ -940,9 +721,7 @@ fn extract_fenced_json(text: &str) -> Vec<String> {
                 let lang = fence_lang.take().unwrap_or_default();
                 let content = buffer.trim().to_string();
                 if !content.is_empty()
-                    && (lang.is_empty()
-                        || lang.starts_with("json")
-                        || content.contains('{'))
+                    && (lang.is_empty() || lang.starts_with("json") || content.contains('{'))
                 {
                     candidates.push(content);
                 }
@@ -1014,122 +793,6 @@ fn extract_braced_json(text: &str) -> Vec<String> {
     }
 
     candidates
-}
-
-async fn call_anthropic_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
-    let key = config
-        .anthropic_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("ANTHROPIC_API_KEY"))?;
-    let body = serde_json::json!({
-        "model": config.judge_model,
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": prompt}],
-    });
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", key)
-        .header("anthropic-version", "2023-06-01")
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    let value: Value = resp.json().await?;
-    Ok(value["content"][0]["text"].as_str().unwrap_or("").to_string())
-}
-
-async fn call_openai_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
-    let key = config
-        .openai_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("OPENAI_API_KEY"))?;
-    let body = serde_json::json!({
-        "model": config.judge_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    });
-    let resp = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .bearer_auth(key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    let value: Value = resp.json().await?;
-    Ok(value["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
-}
-
-async fn call_grok_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
-    let key = config
-        .grok_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GROK_API_KEY"))?;
-    let body = serde_json::json!({
-        "model": config.judge_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    });
-    let resp = client
-        .post("https://api.x.ai/v1/chat/completions")
-        .bearer_auth(key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    let value: Value = resp.json().await?;
-    Ok(value["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
-}
-
-async fn call_gemini_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
-    let key = config
-        .gemini_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GEMINI_API_KEY"))?;
-    let endpoint = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        config.judge_model, key
-    );
-    let body = serde_json::json!({
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
-    });
-    let resp = client
-        .post(endpoint)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    let value: Value = resp.json().await?;
-    Ok(value["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("").to_string())
-}
-
-async fn call_generic_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
-    let key = config
-        .generic_key
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GENERIC_API_KEY"))?;
-    let model = config
-        .generic_model
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GENERIC_MODEL"))?;
-    let url = config
-        .generic_url
-        .as_ref()
-        .ok_or(ProviderError::MissingConfig("GENERIC_API_URL"))?;
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    });
-    let resp = client
-        .post(url)
-        .bearer_auth(key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    let value: Value = resp.json().await?;
-    Ok(value["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
 }
 
 fn render_scoreboard(scores: &JudgeScores) {
