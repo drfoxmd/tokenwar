@@ -114,12 +114,14 @@ struct JudgeResponse<'a> {
     response: &'a str,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
 struct JudgeScores {
     scores: Vec<JudgeScore>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
 struct JudgeScore {
     provider: String,
     accuracy: ScoreItem,
@@ -127,16 +129,32 @@ struct JudgeScore {
     clarity: ScoreItem,
     creativity: ScoreItem,
     conciseness: ScoreItem,
+    #[serde(alias = "overall")]
     _overall: Option<ScoreItem>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
 struct ScoreItem {
     score: f64,
     reasoning: String,
 }
 
-const JUDGE_PROMPT: &str = "You are an expert AI response evaluator. Given a user prompt and multiple AI responses, score each response on these criteria (1-10):\n- Accuracy: Is the information correct and factual?\n- Helpfulness: Does it address what the user actually needs?\n- Clarity: Is it well-structured and easy to understand?\n- Creativity: Does it show original thinking or novel approaches?\n- Conciseness: Is it appropriately detailed without being verbose?\n\nProvide scores as JSON with brief reasoning for each.";
+const JUDGE_SCHEMA_EXAMPLE: &str = r#"{
+  "scores": [
+    {
+      "provider": "OpenAI",
+      "accuracy": { "score": 8.5, "reasoning": "Mostly correct." },
+      "helpfulness": { "score": 8.0, "reasoning": "Addresses the request." },
+      "clarity": { "score": 7.5, "reasoning": "Readable and structured." },
+      "creativity": { "score": 6.0, "reasoning": "Some novel framing." },
+      "conciseness": { "score": 7.0, "reasoning": "Not too verbose." },
+      "_overall": { "score": 7.4, "reasoning": "Solid overall." }
+    }
+  ]
+}"#;
+
+const JUDGE_PROMPT: &str = "You are an expert AI response evaluator. Given a user prompt and multiple AI responses, score each response on these criteria (1-10):\n- Accuracy: Is the information correct and factual?\n- Helpfulness: Does it address what the user actually needs?\n- Clarity: Is it well-structured and easy to understand?\n- Creativity: Does it show original thinking or novel approaches?\n- Conciseness: Is it appropriately detailed without being verbose?\n\nReturn ONLY valid JSON with the exact schema below. Do not wrap in markdown fences. Do not include extra text.\nSchema:\n{\n  \"scores\": [\n    {\n      \"provider\": string,\n      \"accuracy\": { \"score\": number, \"reasoning\": string },\n      \"helpfulness\": { \"score\": number, \"reasoning\": string },\n      \"clarity\": { \"score\": number, \"reasoning\": string },\n      \"creativity\": { \"score\": number, \"reasoning\": string },\n      \"conciseness\": { \"score\": number, \"reasoning\": string },\n      \"_overall\": { \"score\": number, \"reasoning\": string }  // optional\n    }\n  ]\n}\nExample:\n";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -685,43 +703,154 @@ async fn run_judge(client: &Client, config: &Config, prompt: &str, results: &[Pr
         .collect::<Vec<_>>();
 
     let payload = JudgeRequest { prompt, responses };
-    let judge_prompt = format!(
-        "{}\n\nUser prompt:\n{}\n\nResponses:\n{}",
-        JUDGE_PROMPT,
-        prompt,
-        serde_json::to_string_pretty(&payload)?
-    );
+    let judge_prompt = build_judge_prompt(prompt, &payload, false)?;
+    let text = call_judge_with_prompt(client, config, &judge_prompt).await?;
+    match parse_judge_scores(&text) {
+        Ok(scores) => Ok(scores),
+        Err(err) => {
+            eprintln!("Judge JSON parse failed, retrying once: {}", err);
+            let retry_prompt = build_judge_prompt(prompt, &payload, true)?;
+            let retry_text = call_judge_with_prompt(client, config, &retry_prompt).await?;
+            parse_judge_scores(&retry_text)
+        }
+    }
+}
 
+fn build_judge_prompt(prompt: &str, payload: &JudgeRequest<'_>, retry: bool) -> Result<String> {
+    let retry_prefix = if retry {
+        "Your previous response was invalid. Return ONLY valid JSON matching the schema below. No markdown, no prose.\n\n"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{retry_prefix}{JUDGE_PROMPT}{example}\n\nUser prompt:\n{prompt}\n\nResponses:\n{payload}",
+        example = JUDGE_SCHEMA_EXAMPLE,
+        payload = serde_json::to_string_pretty(payload)?,
+    ))
+}
+
+async fn call_judge_with_prompt(client: &Client, config: &Config, prompt: &str) -> Result<String> {
     match config.judge_provider.as_str() {
-        "anthropic" => {
-            let text = call_anthropic_judge(client, config, &judge_prompt).await?;
-            parse_judge_scores(&text)
-        }
-        "openai" => {
-            let text = call_openai_judge(client, config, &judge_prompt).await?;
-            parse_judge_scores(&text)
-        }
-        "grok" => {
-            let text = call_grok_judge(client, config, &judge_prompt).await?;
-            parse_judge_scores(&text)
-        }
-        "gemini" => {
-            let text = call_gemini_judge(client, config, &judge_prompt).await?;
-            parse_judge_scores(&text)
-        }
-        "generic" => {
-            let text = call_generic_judge(client, config, &judge_prompt).await?;
-            parse_judge_scores(&text)
-        }
+        "anthropic" => call_anthropic_judge(client, config, prompt).await,
+        "openai" => call_openai_judge(client, config, prompt).await,
+        "grok" => call_grok_judge(client, config, prompt).await,
+        "gemini" => call_gemini_judge(client, config, prompt).await,
+        "generic" => call_generic_judge(client, config, prompt).await,
         other => Err(anyhow!("unsupported JUDGE_PROVIDER: {}", other)),
     }
 }
 
 fn parse_judge_scores(text: &str) -> Result<JudgeScores> {
-    let json_start = text.find('{').ok_or_else(|| anyhow!("judge returned no JSON"))?;
-    let json_str = &text[json_start..];
-    let scores: JudgeScores = serde_json::from_str(json_str).context("failed to parse judge JSON")?;
-    Ok(scores)
+    for candidate in extract_json_candidates(text) {
+        if let Ok(scores) = serde_json::from_str::<JudgeScores>(&candidate) {
+            return Ok(scores);
+        }
+    }
+    Err(anyhow!("failed to parse judge JSON from response"))
+}
+
+fn extract_json_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for candidate in extract_fenced_json(text) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    for candidate in extract_braced_json(text) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn extract_fenced_json(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut in_fence = false;
+    let mut fence_lang: Option<String> = None;
+    let mut buffer = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                let lang = fence_lang.take().unwrap_or_default();
+                let content = buffer.trim().to_string();
+                if !content.is_empty()
+                    && (lang.is_empty()
+                        || lang.starts_with("json")
+                        || content.contains('{'))
+                {
+                    candidates.push(content);
+                }
+                buffer.clear();
+                in_fence = false;
+            } else {
+                let lang = trimmed.trim_start_matches("```").trim().to_lowercase();
+                fence_lang = Some(lang);
+                in_fence = true;
+            }
+            continue;
+        }
+
+        if in_fence {
+            buffer.push_str(line);
+            buffer.push('\n');
+        }
+    }
+
+    if in_fence {
+        let content = buffer.trim().to_string();
+        if !content.is_empty() && content.contains('{') {
+            candidates.push(content);
+        }
+    }
+
+    candidates
+}
+
+fn extract_braced_json(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(start_idx) = start.take() {
+                            candidates.push(text[start_idx..=idx].to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
 }
 
 async fn call_anthropic_judge(client: &Client, config: &Config, prompt: &str) -> Result<String> {
