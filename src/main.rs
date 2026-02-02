@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::{
     env,
     io::{self, Read},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -39,6 +39,9 @@ struct Args {
     /// Disable the TUI and print plain output
     #[arg(long)]
     no_tui: bool,
+    /// Output machine-readable JSON (conflicts with --no-tui)
+    #[arg(long, conflicts_with = "no_tui")]
+    json: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,12 +117,12 @@ struct JudgeResponse<'a> {
     response: &'a str,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Serialize)]
 struct JudgeScores {
     scores: Vec<JudgeScore>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Serialize)]
 struct JudgeScore {
     provider: String,
     accuracy: ScoreItem,
@@ -130,10 +133,33 @@ struct JudgeScore {
     _overall: Option<ScoreItem>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Serialize)]
 struct ScoreItem {
     score: f64,
     reasoning: String,
+}
+
+#[derive(Serialize)]
+struct JsonOutput {
+    prompt: String,
+    providers: Vec<JsonProvider>,
+    scores: Vec<JudgeScore>,
+    metadata: JsonMetadata,
+}
+
+#[derive(Serialize)]
+struct JsonProvider {
+    name: String,
+    model: Option<String>,
+    response_text: String,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonMetadata {
+    timestamp: u64,
+    timeout_secs: u64,
+    stream: bool,
 }
 
 const JUDGE_PROMPT: &str = "You are an expert AI response evaluator. Given a user prompt and multiple AI responses, score each response on these criteria (1-10):\n- Accuracy: Is the information correct and factual?\n- Helpfulness: Does it address what the user actually needs?\n- Clarity: Is it well-structured and easy to understand?\n- Creativity: Does it show original thinking or novel approaches?\n- Conciseness: Is it appropriately detailed without being verbose?\n\nProvide scores as JSON with brief reasoning for each.";
@@ -229,8 +255,10 @@ async fn main() -> Result<()> {
         },
     ];
 
-    if args.no_tui {
-        collect_plain(rx, &mut results).await?;
+    if args.json {
+        collect_plain(rx, &mut results, false).await?;
+    } else if args.no_tui {
+        collect_plain(rx, &mut results, true).await?;
     } else {
         run_tui(rx, &mut results).await?;
     }
@@ -240,7 +268,41 @@ async fn main() -> Result<()> {
     }
 
     let judge = run_judge(&client, &config, &prompt, &results).await?;
-    render_scoreboard(&judge);
+    if args.json {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let providers = results
+            .iter()
+            .map(|result| JsonProvider {
+                name: result.provider.name().to_string(),
+                model: match result.provider {
+                    Provider::Anthropic => Some(config.anthropic_model.clone()),
+                    Provider::OpenAI => Some(config.openai_model.clone()),
+                    Provider::Grok => Some(config.grok_model.clone()),
+                    Provider::Gemini => Some(config.gemini_model.clone()),
+                    Provider::Generic => config.generic_model.clone(),
+                },
+                response_text: result.text.trim().to_string(),
+                error: result.error.clone(),
+            })
+            .collect();
+        let output = JsonOutput {
+            prompt: prompt.clone(),
+            providers,
+            scores: judge.scores,
+            metadata: JsonMetadata {
+                timestamp,
+                timeout_secs: args.timeout_secs,
+                stream: args.stream,
+            },
+        };
+        let json = serde_json::to_string_pretty(&output)?;
+        println!("{}", json);
+    } else {
+        render_scoreboard(&judge);
+    }
 
     Ok(())
 }
@@ -263,7 +325,7 @@ fn load_config() -> Result<Config> {
     })
 }
 
-async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult]) -> Result<()> {
+async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult], print_output: bool) -> Result<()> {
     while let Some(update) = rx.recv().await {
         let entry = &mut results[update.index];
         if let Some(chunk) = update.append {
@@ -273,12 +335,14 @@ async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Pr
             entry.error = Some(err);
         }
         if update.done {
-            let label = entry.provider.name();
-            println!("\n=== {} ===", label);
-            if let Some(err) = &entry.error {
-                println!("Error: {}", err);
-            } else {
-                println!("{}", entry.text.trim());
+            if print_output {
+                let label = entry.provider.name();
+                println!("\n=== {} ===", label);
+                if let Some(err) = &entry.error {
+                    println!("Error: {}", err);
+                } else {
+                    println!("{}", entry.text.trim());
+                }
             }
         }
     }
