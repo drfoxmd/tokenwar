@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::{
     env,
     io::{self, Read},
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -39,6 +39,9 @@ struct Args {
     /// Disable the TUI and print plain output
     #[arg(long)]
     no_tui: bool,
+    /// Output machine-readable JSON (conflicts with --no-tui)
+    #[arg(long, conflicts_with = "no_tui")]
+    json: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +96,7 @@ struct ProviderUpdate {
     append: Option<String>,
     done: bool,
     error: Option<String>,
+    latency: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +104,7 @@ struct ProviderResult {
     provider: Provider,
     text: String,
     error: Option<String>,
+    latency: Option<Duration>,
 }
 
 #[derive(Serialize)]
@@ -114,13 +119,13 @@ struct JudgeResponse<'a> {
     response: &'a str,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Serialize)]
 #[serde(default)]
 struct JudgeScores {
     scores: Vec<JudgeScore>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Serialize)]
 #[serde(default)]
 struct JudgeScore {
     provider: String,
@@ -133,7 +138,7 @@ struct JudgeScore {
     _overall: Option<ScoreItem>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Serialize)]
 #[serde(default)]
 struct ScoreItem {
     score: f64,
@@ -155,6 +160,30 @@ const JUDGE_SCHEMA_EXAMPLE: &str = r#"{
 }"#;
 
 const JUDGE_PROMPT: &str = "You are an expert AI response evaluator. Given a user prompt and multiple AI responses, score each response on these criteria (1-10):\n- Accuracy: Is the information correct and factual?\n- Helpfulness: Does it address what the user actually needs?\n- Clarity: Is it well-structured and easy to understand?\n- Creativity: Does it show original thinking or novel approaches?\n- Conciseness: Is it appropriately detailed without being verbose?\n\nReturn ONLY valid JSON with the exact schema below. Do not wrap in markdown fences. Do not include extra text.\nSchema:\n{\n  \"scores\": [\n    {\n      \"provider\": string,\n      \"accuracy\": { \"score\": number, \"reasoning\": string },\n      \"helpfulness\": { \"score\": number, \"reasoning\": string },\n      \"clarity\": { \"score\": number, \"reasoning\": string },\n      \"creativity\": { \"score\": number, \"reasoning\": string },\n      \"conciseness\": { \"score\": number, \"reasoning\": string },\n      \"_overall\": { \"score\": number, \"reasoning\": string }  // optional\n    }\n  ]\n}\nExample:\n";
+
+#[derive(Serialize)]
+struct JsonOutput {
+    prompt: String,
+    providers: Vec<JsonProvider>,
+    scores: Vec<JudgeScore>,
+    metadata: JsonMetadata,
+}
+
+#[derive(Serialize)]
+struct JsonProvider {
+    name: String,
+    model: Option<String>,
+    response_text: String,
+    error: Option<String>,
+    latency_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct JsonMetadata {
+    timestamp: u64,
+    timeout_secs: u64,
+    stream: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -196,6 +225,7 @@ async fn main() -> Result<()> {
         let prompt = prompt.clone();
         let stream = args.stream;
         let handle = tokio::spawn(async move {
+            let start = Instant::now();
             let result = match provider {
                 Provider::Anthropic => call_anthropic(&client, &config, &prompt, stream, index, tx.clone()).await,
                 Provider::OpenAI => call_openai(&client, &config, &prompt, stream, index, tx.clone()).await,
@@ -210,6 +240,7 @@ async fn main() -> Result<()> {
                         append: None,
                         done: true,
                         error: Some(err.to_string()),
+                        latency: Some(start.elapsed()),
                     })
                     .await;
             }
@@ -225,11 +256,14 @@ async fn main() -> Result<()> {
             provider,
             text: String::new(),
             error: None,
+            latency: None,
         })
         .collect::<Vec<_>>();
 
-    if args.no_tui {
-        collect_plain(rx, &mut results).await?;
+    if args.json {
+        collect_plain(rx, &mut results, false).await?;
+    } else if args.no_tui {
+        collect_plain(rx, &mut results, true).await?;
     } else {
         run_tui(rx, &mut results).await?;
     }
@@ -239,7 +273,42 @@ async fn main() -> Result<()> {
     }
 
     let judge = run_judge(&client, &config, &prompt, &results).await?;
-    render_scoreboard(&judge);
+    if args.json {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let providers = results
+            .iter()
+            .map(|result| JsonProvider {
+                name: result.provider.name().to_string(),
+                model: match result.provider {
+                    Provider::Anthropic => config.anthropic_model.clone(),
+                    Provider::OpenAI => config.openai_model.clone(),
+                    Provider::Grok => config.grok_model.clone(),
+                    Provider::Gemini => config.gemini_model.clone(),
+                    Provider::Generic => config.generic_model.clone(),
+                },
+                response_text: result.text.trim().to_string(),
+                error: result.error.clone(),
+                latency_ms: result.latency.map(|latency| latency.as_millis() as u64),
+            })
+            .collect();
+        let output = JsonOutput {
+            prompt: prompt.clone(),
+            providers,
+            scores: judge.scores,
+            metadata: JsonMetadata {
+                timestamp,
+                timeout_secs: args.timeout_secs,
+                stream: args.stream,
+            },
+        };
+        let json = serde_json::to_string_pretty(&output)?;
+        println!("{}", json);
+    } else {
+        render_scoreboard(&judge);
+    }
 
     Ok(())
 }
@@ -282,7 +351,7 @@ fn configured_providers(config: &Config) -> Vec<Provider> {
     providers
 }
 
-async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult]) -> Result<()> {
+async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [ProviderResult], print_output: bool) -> Result<()> {
     while let Some(update) = rx.recv().await {
         let entry = &mut results[update.index];
         if let Some(chunk) = update.append {
@@ -291,13 +360,18 @@ async fn collect_plain(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Pr
         if let Some(err) = update.error {
             entry.error = Some(err);
         }
+        if let Some(latency) = update.latency {
+            entry.latency = Some(latency);
+        }
         if update.done {
-            let label = entry.provider.name();
-            println!("\n=== {} ===", label);
-            if let Some(err) = &entry.error {
-                println!("Error: {}", err);
-            } else {
-                println!("{}", entry.text.trim());
+            if print_output {
+                let label = entry.provider.name();
+                println!("\n=== {} ===", label);
+                if let Some(err) = &entry.error {
+                    println!("Error: {}", err);
+                } else {
+                    println!("{}", entry.text.trim());
+                }
             }
         }
     }
@@ -322,6 +396,9 @@ async fn run_tui(mut rx: mpsc::Receiver<ProviderUpdate>, results: &mut [Provider
             }
             if let Some(err) = update.error {
                 entry.error = Some(err);
+            }
+            if let Some(latency) = update.latency {
+                entry.latency = Some(latency);
             }
             if update.done {
                 done_count += 1;
@@ -436,6 +513,7 @@ async fn call_anthropic(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let start = Instant::now();
     let key = config
         .anthropic_key
         .as_ref()
@@ -477,6 +555,7 @@ async fn call_anthropic(
                                         append: Some(delta.to_string()),
                                         done: false,
                                         error: None,
+                                        latency: None,
                                     })
                                     .await;
                             }
@@ -499,6 +578,7 @@ async fn call_anthropic(
                 append: Some(text),
                 done: false,
                 error: None,
+                latency: None,
             })
             .await;
     }
@@ -509,6 +589,7 @@ async fn call_anthropic(
             append: None,
             done: true,
             error: None,
+            latency: Some(start.elapsed()),
         })
         .await;
     Ok(())
@@ -606,6 +687,7 @@ async fn call_openai_like(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let start = Instant::now();
     let body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -638,6 +720,7 @@ async fn call_openai_like(
                                     append: Some(delta.to_string()),
                                     done: false,
                                     error: None,
+                                    latency: None,
                                 })
                                 .await;
                         }
@@ -658,6 +741,7 @@ async fn call_openai_like(
                 append: Some(text),
                 done: false,
                 error: None,
+                latency: None,
             })
             .await;
     }
@@ -668,6 +752,7 @@ async fn call_openai_like(
             append: None,
             done: true,
             error: None,
+            latency: Some(start.elapsed()),
         })
         .await;
     Ok(())
@@ -681,6 +766,7 @@ async fn call_gemini(
     index: usize,
     tx: mpsc::Sender<ProviderUpdate>,
 ) -> Result<()> {
+    let start = Instant::now();
     let key = config
         .gemini_key
         .as_ref()
@@ -729,6 +815,7 @@ async fn call_gemini(
                                 append: Some(part.to_string()),
                                 done: false,
                                 error: None,
+                                latency: None,
                             })
                             .await;
                     }
@@ -748,6 +835,7 @@ async fn call_gemini(
                 append: Some(text),
                 done: false,
                 error: None,
+                latency: None,
             })
             .await;
     }
@@ -758,6 +846,7 @@ async fn call_gemini(
             append: None,
             done: true,
             error: None,
+            latency: Some(start.elapsed()),
         })
         .await;
     Ok(())
