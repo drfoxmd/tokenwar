@@ -8,10 +8,11 @@ use crossterm::{
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
     Terminal,
 };
 use reqwest::{header, Client};
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     env,
-    io::{self, Read},
+    io::{self, Read, Write},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
@@ -45,6 +46,18 @@ struct Args {
     /// Output machine-readable JSON (conflicts with --no-tui)
     #[arg(long, conflicts_with = "no_tui")]
     json: bool,
+    /// Stream newline-delimited JSON events (conflicts with --json, --no-tui, --screenshot)
+    #[arg(long, conflicts_with_all = ["json", "no_tui", "screenshot"])]
+    json_stream: bool,
+    /// Save a PNG screenshot of the final TUI state (optional path)
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "tokenwar_screenshot.png",
+        conflicts_with_all = ["no_tui", "json", "json_stream"]
+    )]
+    screenshot: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,20 +233,59 @@ async fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    if args.json {
+    let ran_tui = !args.json && !args.no_tui && !args.json_stream;
+    if args.json_stream {
+        let start_event = serde_json::json!({
+            "event": "start",
+            "prompt": prompt.clone(),
+            "models": config.models.iter().map(|model| model.model.clone()).collect::<Vec<_>>(),
+        });
+        emit_event(&start_event);
+        collect_json_stream(rx, &mut results).await?;
+    } else if args.json {
         collect_plain(rx, &mut results, false).await?;
     } else if args.no_tui {
         collect_plain(rx, &mut results, true).await?;
     } else {
-        run_tui(rx, &mut results).await?;
+        run_tui(rx, &mut results, args.screenshot.clone()).await?;
     }
 
+    if ran_tui {
+        for handle in &handles {
+            handle.abort();
+        }
+    }
     for handle in handles {
         let _ = handle.await;
     }
 
+    if ran_tui {
+        for result in results.iter_mut() {
+            if result.text.trim().is_empty() && result.error.is_none() {
+                result.error = Some("Generation cancelled by user".to_string());
+            }
+        }
+        let all_cancelled = results.iter().all(|result| result.text.trim().is_empty());
+        if all_cancelled {
+            return Ok(());
+        }
+    }
+
+    if args.json_stream {
+        let judging_event = serde_json::json!({ "event": "judging" });
+        emit_event(&judging_event);
+    }
+
     let judge = run_judge(&client, &config, &prompt, &results).await?;
-    if args.json {
+    if args.json_stream {
+        let scores_event = serde_json::json!({
+            "event": "scores",
+            "scores": judge.scores,
+        });
+        emit_event(&scores_event);
+        let done_event = serde_json::json!({ "event": "done" });
+        emit_event(&done_event);
+    } else if args.json {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -265,6 +317,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn emit_event(value: &serde_json::Value) {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    println!("{}", json);
+    io::stdout().flush().unwrap();
 }
 
 fn load_config() -> Result<Config> {
@@ -367,9 +425,45 @@ async fn collect_plain(
     Ok(())
 }
 
+async fn collect_json_stream(
+    mut rx: mpsc::Receiver<ProviderUpdate>,
+    results: &mut [ProviderResult],
+) -> Result<()> {
+    while let Some(update) = rx.recv().await {
+        let entry = &mut results[update.index];
+        if let Some(chunk) = update.append {
+            entry.text.push_str(&chunk);
+        }
+        if let Some(err) = update.error {
+            entry.error = Some(err);
+        }
+        if let Some(latency) = update.latency {
+            entry.latency = Some(latency);
+        }
+        if update.done {
+            let provider = entry.model.name.clone();
+            let model = entry.model.model.clone();
+            let response_text = entry.text.trim().to_string();
+            let error = entry.error.clone();
+            let latency_ms = entry.latency.map(|lat| lat.as_millis() as u64);
+            let response_event = serde_json::json!({
+                "event": "response",
+                "provider": provider,
+                "model": model,
+                "response_text": response_text,
+                "error": error,
+                "latency_ms": latency_ms,
+            });
+            emit_event(&response_event);
+        }
+    }
+    Ok(())
+}
+
 async fn run_tui(
     mut rx: mpsc::Receiver<ProviderUpdate>,
     results: &mut [ProviderResult],
+    screenshot_path: Option<String>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -378,55 +472,174 @@ async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut done_count = 0usize;
+    let mut focused_index = 0usize;
+    let mut scroll_offsets = vec![0usize; results.len()];
+    let mut fullscreen = false;
+    let mut last_size = None;
+    let start_time = Instant::now();
+    let mut frame_counter: u64 = 0;
 
-    loop {
-        while let Ok(update) = rx.try_recv() {
-            let entry = &mut results[update.index];
-            if let Some(chunk) = update.append {
-                entry.text.push_str(&chunk);
-            }
-            if let Some(err) = update.error {
-                entry.error = Some(err);
-            }
-            if let Some(latency) = update.latency {
-                entry.latency = Some(latency);
-            }
-            if update.done {
-                done_count += 1;
-            }
-        }
-
-        terminal.draw(|f| {
-            let size = f.size();
-            if results.is_empty() {
-                return;
-            }
-
-            let panels = layout_panels(size, results.len());
-            for (idx, rect) in panels.into_iter().enumerate() {
-                if let Some(result) = results.get(idx) {
-                    render_panel(f, rect, result);
+    let result = (|| -> Result<()> {
+        loop {
+            while let Ok(update) = rx.try_recv() {
+                let entry = &mut results[update.index];
+                if let Some(chunk) = update.append {
+                    entry.text.push_str(&chunk);
+                }
+                if let Some(err) = update.error {
+                    entry.error = Some(err);
+                }
+                if let Some(latency) = update.latency {
+                    entry.latency = Some(latency);
                 }
             }
-        })?;
 
-        if done_count >= results.len() {
-            break;
-        }
+            if !results.is_empty() {
+                focused_index = focused_index.min(results.len().saturating_sub(1));
+            }
 
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
+            let size = terminal.size()?;
+            last_size = Some(size);
+            let panels = if fullscreen {
+                vec![size]
+            } else {
+                layout_panels(size, results.len())
+            };
+
+            if !results.is_empty() {
+                let line_count = |result: &ProviderResult| -> usize {
+                    if result.error.is_some() {
+                        return 1;
+                    }
+                    let trimmed = result.text.trim();
+                    let count = trimmed.lines().count();
+                    if count == 0 { 1 } else { count }
+                };
+
+                if fullscreen {
+                    let result = &results[focused_index];
+                    let total_lines = line_count(result);
+                    let visible_lines = panels[0].height.saturating_sub(2) as usize;
+                    let visible_lines = visible_lines.max(1);
+                    let max_offset = total_lines.saturating_sub(visible_lines);
+                    scroll_offsets[focused_index] = scroll_offsets[focused_index].min(max_offset);
+                } else {
+                    for (idx, result) in results.iter().enumerate() {
+                        let total_lines = line_count(result);
+                        let area = panels.get(idx).copied().unwrap_or(size);
+                        let visible_lines = area.height.saturating_sub(2) as usize;
+                        let visible_lines = visible_lines.max(1);
+                        let max_offset = total_lines.saturating_sub(visible_lines);
+                        scroll_offsets[idx] = scroll_offsets[idx].min(max_offset);
+                    }
                 }
             }
+
+            terminal.draw(|f| {
+                if results.is_empty() {
+                    return;
+                }
+
+                if fullscreen {
+                    let result = &results[focused_index];
+                    render_panel(
+                        f,
+                        panels[0],
+                        result,
+                        true,
+                        scroll_offsets[focused_index],
+                        frame_counter,
+                        start_time.elapsed(),
+                    );
+                } else {
+                    for (idx, rect) in panels.iter().copied().enumerate() {
+                        if let Some(result) = results.get(idx) {
+                            let focused = idx == focused_index;
+                            render_panel(
+                                f,
+                                rect,
+                                result,
+                                focused,
+                                scroll_offsets[idx],
+                                frame_counter,
+                                start_time.elapsed(),
+                            );
+                        }
+                    }
+                }
+            })?;
+
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            break;
+                        }
+                        KeyCode::Tab => {
+                            if !results.is_empty() {
+                                focused_index = (focused_index + 1) % results.len();
+                            }
+                        }
+                        KeyCode::Char(' ') => {
+                            if !results.is_empty() {
+                                fullscreen = !fullscreen;
+                            }
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !results.is_empty() {
+                                let area = if fullscreen {
+                                    panels[0]
+                                } else {
+                                    panels[focused_index]
+                                };
+                                let result = &results[focused_index];
+                                let total_lines = if result.error.is_some() {
+                                    1
+                                } else {
+                                    let trimmed = result.text.trim();
+                                    let count = trimmed.lines().count();
+                                    if count == 0 { 1 } else { count }
+                                };
+                                let visible_lines = area.height.saturating_sub(2) as usize;
+                                let visible_lines = visible_lines.max(1);
+                                let max_offset = total_lines.saturating_sub(visible_lines);
+                                scroll_offsets[focused_index] =
+                                    (scroll_offsets[focused_index] + 1).min(max_offset);
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if !results.is_empty() {
+                                scroll_offsets[focused_index] =
+                                    scroll_offsets[focused_index].saturating_sub(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            frame_counter = frame_counter.wrapping_add(1);
         }
+
+        Ok(())
+    })();
+
+    if let (Some(path), Some(size)) = (screenshot_path.as_deref(), last_size) {
+        save_tui_screenshot(
+            path,
+            size,
+            results,
+            fullscreen,
+            focused_index,
+            &scroll_offsets,
+            frame_counter,
+            start_time.elapsed(),
+        )?;
     }
 
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
+    result
 }
 
 fn layout_panels(area: Rect, count: usize) -> Vec<Rect> {
@@ -485,23 +698,182 @@ fn equal_constraints(count: usize) -> Vec<Constraint> {
         .collect()
 }
 
-fn render_panel(f: &mut ratatui::Frame, area: Rect, result: &ProviderResult) {
-    let title = if let Some(_err) = &result.error {
+fn panel_text(result: &ProviderResult, frame: u64, elapsed: Duration) -> String {
+    if let Some(err) = &result.error {
+        return format!("Error: {}", err);
+    }
+    let trimmed = result.text.trim();
+    if trimmed.is_empty() {
+        let phases = ["Generating.", "Generating..", "Generating..."];
+        let phase = ((frame / 6) as usize) % phases.len();
+        let mut text = phases[phase].to_string();
+        if result.latency.is_none() {
+            text.push_str(&format!(" ({:.1}s)", elapsed.as_secs_f32()));
+        }
+        return text;
+    }
+    trimmed.to_string()
+}
+
+fn render_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    result: &ProviderResult,
+    focused: bool,
+    scroll_offset: usize,
+    frame: u64,
+    elapsed: Duration,
+) {
+    let title_base = if let Some(_err) = &result.error {
         format!("{} (error)", result.model.name)
     } else {
         result.model.name.clone()
     };
-    let mut text = result.text.trim().to_string();
-    if let Some(err) = &result.error {
-        text = format!("Error: {}", err);
-    }
+    let text = panel_text(result, frame, elapsed);
+    let total_lines = {
+        let count = text.lines().count();
+        if count == 0 { 1 } else { count }
+    };
+    let visible_lines = area.height.saturating_sub(2) as usize;
+    let visible_lines = visible_lines.max(1);
+    let max_offset = total_lines.saturating_sub(visible_lines);
+    let clamped_offset = scroll_offset.min(max_offset);
+    let indicator = format!("[{}/{}]", clamped_offset.saturating_add(1), total_lines);
+    let title = format!("{} {}", title_base, indicator);
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let block = Block::default()
-        .title(Span::styled(title, Style::default().fg(Color::Cyan)))
-        .borders(Borders::ALL);
+        .title(Span::styled(title, border_style))
+        .borders(Borders::ALL)
+        .border_style(border_style);
     let paragraph = Paragraph::new(Text::from(text))
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((clamped_offset as u16, 0));
     f.render_widget(paragraph, area);
+}
+
+fn render_panel_to_buffer(
+    buffer: &mut Buffer,
+    area: Rect,
+    result: &ProviderResult,
+    focused: bool,
+    scroll_offset: usize,
+    frame: u64,
+    elapsed: Duration,
+) {
+    let title_base = if let Some(_err) = &result.error {
+        format!("{} (error)", result.model.name)
+    } else {
+        result.model.name.clone()
+    };
+    let text = panel_text(result, frame, elapsed);
+    let total_lines = {
+        let count = text.lines().count();
+        if count == 0 { 1 } else { count }
+    };
+    let visible_lines = area.height.saturating_sub(2) as usize;
+    let visible_lines = visible_lines.max(1);
+    let max_offset = total_lines.saturating_sub(visible_lines);
+    let clamped_offset = scroll_offset.min(max_offset);
+    let indicator = format!("[{}/{}]", clamped_offset.saturating_add(1), total_lines);
+    let title = format!("{} {}", title_base, indicator);
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .title(Span::styled(title, border_style))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let paragraph = Paragraph::new(Text::from(text))
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((clamped_offset as u16, 0));
+    paragraph.render(area, buffer);
+}
+
+fn buffer_to_text(buffer: &Buffer) -> String {
+    let area = *buffer.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let cell = buffer.get(area.x + x, area.y + y);
+            let symbol = cell.symbol();
+            if symbol.is_empty() {
+                out.push(' ');
+            } else {
+                out.push_str(symbol);
+            }
+        }
+        if y + 1 < area.height {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn save_tui_screenshot(
+    path: &str,
+    size: Rect,
+    results: &[ProviderResult],
+    fullscreen: bool,
+    focused_index: usize,
+    scroll_offsets: &[usize],
+    frame: u64,
+    elapsed: Duration,
+) -> Result<()> {
+    if results.is_empty() || size.width == 0 || size.height == 0 {
+        return Ok(());
+    }
+
+    let mut buffer = Buffer::empty(Rect::new(0, 0, size.width, size.height));
+    let panels = if fullscreen {
+        vec![size]
+    } else {
+        layout_panels(size, results.len())
+    };
+
+    if fullscreen {
+        let idx = focused_index.min(results.len().saturating_sub(1));
+        render_panel_to_buffer(
+            &mut buffer,
+            panels[0],
+            &results[idx],
+            true,
+            *scroll_offsets.get(idx).unwrap_or(&0),
+            frame,
+            elapsed,
+        );
+    } else {
+        for (idx, rect) in panels.iter().copied().enumerate() {
+            if let Some(result) = results.get(idx) {
+                render_panel_to_buffer(
+                    &mut buffer,
+                    rect,
+                    result,
+                    idx == focused_index,
+                    *scroll_offsets.get(idx).unwrap_or(&0),
+                    frame,
+                    elapsed,
+                );
+            }
+        }
+    }
+
+    let text = buffer_to_text(&buffer);
+    let font = ansee::Font {
+        name: None,
+        size: 14.0,
+        line_height: 1.1,
+    };
+    let image = ansee::draw_image(&text, font)?;
+    image.save(path)?;
+    Ok(())
 }
 
 async fn call_model(
