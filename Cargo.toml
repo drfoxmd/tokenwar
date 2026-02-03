@@ -15,3 +15,4 @@ reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "d
 futures-util = "0.3"
 ratatui = "0.26"
 crossterm = "0.27"
+ansee = "0.1.3"
